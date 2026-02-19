@@ -4,7 +4,13 @@ import argparse
 import os
 import sys
 
-from .finger_joints import DEFAULT_FINGER_WIDTH, DEFAULT_EDGE_MARGIN, DEFAULT_NOTCH_BUFFER, DEFAULT_PLATEAU_INSET
+from .finger_joints import (
+    DEFAULT_EDGE_MARGIN,
+    DEFAULT_FINGER_WIDTH,
+    DEFAULT_MIN_PLATEAU_LENGTH,
+    DEFAULT_NOTCH_BUFFER,
+    DEFAULT_PLATEAU_INSET,
+)
 
 
 def main():
@@ -35,6 +41,8 @@ def main():
                         help=f"Safe zone around notches in mm, -1 = auto ({DEFAULT_NOTCH_BUFFER}mm)")
     parser.add_argument("--plateau-inset", type=float, default=-1,
                         help=f"Inset from plateau boundaries in mm, -1 = auto ({DEFAULT_PLATEAU_INSET}mm)")
+    parser.add_argument("--min-plateau-length", type=float, default=-1,
+                        help=f"Minimum plateau segment length in mm, -1 = auto ({DEFAULT_MIN_PLATEAU_LENGTH}mm)")
 
     args = parser.parse_args()
 
@@ -112,9 +120,12 @@ def main():
     em_display = args.edge_margin if args.edge_margin >= 0 else DEFAULT_EDGE_MARGIN
     nb_display = args.notch_buffer if args.notch_buffer >= 0 else DEFAULT_NOTCH_BUFFER
     pi_display = args.plateau_inset if args.plateau_inset >= 0 else DEFAULT_PLATEAU_INSET
+    mpl_display = (args.min_plateau_length if args.min_plateau_length >= 0
+                   else DEFAULT_MIN_PLATEAU_LENGTH)
     print(f"  Edge margin: {em_display} mm")
     print(f"  Notch buffer: {nb_display} mm")
     print(f"  Plateau inset: {pi_display} mm")
+    print(f"  Min plateau length: {mpl_display} mm")
 
     modified_polygons, slot_cutouts = apply_finger_joints(
         projections, relevant_shared,
@@ -125,6 +136,7 @@ def main():
         edge_margin=args.edge_margin,
         notch_buffer=args.notch_buffer,
         plateau_inset=args.plateau_inset,
+        min_plateau_length=args.min_plateau_length,
         faces=faces,
         all_shared_edges=shared_edges,
     )

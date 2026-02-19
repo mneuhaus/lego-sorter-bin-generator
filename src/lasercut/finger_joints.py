@@ -23,6 +23,8 @@ DEFAULT_EDGE_MARGIN = 10.0
 DEFAULT_NOTCH_BUFFER = 2.0
 # Inset from plateau (mountain) boundaries where fingers start/end.
 DEFAULT_PLATEAU_INSET = 3.0
+# Minimum usable plateau segment length in mm.
+DEFAULT_MIN_PLATEAU_LENGTH = 12.0
 
 
 def _dist_2d(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -197,7 +199,8 @@ def _make_comb(p1: tuple[float, float], p2: tuple[float, float],
                overlap: float = 0.01,
                exclusion_zones: list[Polygon] | None = None,
                cut_margins: bool = False,
-               plateau_segments: list[tuple[float, float]] | None = None) -> list[Polygon]:
+               plateau_segments: list[tuple[float, float]] | None = None,
+               min_plateau_length: float = 0.0) -> list[Polygon]:
     """Create a list of rectangular 'teeth' along an edge.
 
     When plateau_segments is provided (non-empty list), teeth are distributed
@@ -219,6 +222,8 @@ def _make_comb(p1: tuple[float, float], p2: tuple[float, float],
         plateau_segments: Optional list of (t_start, t_end) parametric ranges
                          where fingers should be placed. Each segment gets its
                          own evenly-distributed set of fingers.
+        min_plateau_length: Minimum segment length (mm) for plateau segments.
+                           Segments shorter than this are ignored.
 
     Returns:
         List of Shapely Polygon rectangles (the teeth).
@@ -267,7 +272,11 @@ def _make_comb(p1: tuple[float, float], p2: tuple[float, float],
 
     for seg_s, seg_e in segments:
         seg_len = (seg_e - seg_s) * edge_len
-        if seg_len < finger_width * 0.5:
+        if plateau_segments:
+            min_len = max(finger_width * 0.5, min_plateau_length)
+        else:
+            min_len = finger_width * 0.5
+        if seg_len < min_len:
             continue
         n = _compute_n_fingers(seg_len, finger_width, margin=0)
 
@@ -391,6 +400,7 @@ def apply_finger_joints(
     edge_margin: float = -1,
     notch_buffer: float = -1,
     plateau_inset: float = -1,
+    min_plateau_length: float = -1,
     faces: list[PlanarFace] | None = None,
     all_shared_edges: list[SharedEdge] | None = None,
 ) -> tuple[dict[int, list[tuple[float, float]]], dict[int, list[list[tuple[float, float]]]]]:
@@ -399,6 +409,7 @@ def apply_finger_joints(
     For each shared edge:
     - Detects plateau (mountain) segments on both faces
     - Intersects plateau segments so tabs and slots match
+    - Skips tiny plateau segments below min_plateau_length
     - Distributes fingers evenly within each plateau segment
     - Positive face: union with comb (tabs protrude outward)
     - Negative face: difference with comb (slots cut inward)
@@ -418,6 +429,8 @@ def apply_finger_joints(
         notch_buffer = DEFAULT_NOTCH_BUFFER
     if plateau_inset < 0:
         plateau_inset = DEFAULT_PLATEAU_INSET
+    if min_plateau_length < 0:
+        min_plateau_length = DEFAULT_MIN_PLATEAU_LENGTH
 
     kerf_half = kerf / 2
 
@@ -531,13 +544,15 @@ def apply_finger_joints(
             if is_positive:
                 teeth = _make_comb(p1, p2, depth, finger_width, outward,
                                    margin=edge_margin, exclusion_zones=zones,
-                                   plateau_segments=plateaus)
+                                   plateau_segments=plateaus,
+                                   min_plateau_length=min_plateau_length)
             else:
                 inward = (-outward[0], -outward[1])
                 teeth = _make_comb(p1, p2, depth, finger_width, inward,
                                    margin=edge_margin, exclusion_zones=zones,
                                    cut_margins=True,
-                                   plateau_segments=plateaus)
+                                   plateau_segments=plateaus,
+                                   min_plateau_length=min_plateau_length)
 
             if not teeth:
                 continue
@@ -621,7 +636,8 @@ def apply_finger_joints(
 
                 slot_teeth = _make_comb(slot_start, slot_end, slot_depth, finger_width, inward,
                                         margin=edge_margin, exclusion_zones=bottom_zones,
-                                        plateau_segments=shared_plateaus)
+                                        plateau_segments=shared_plateaus,
+                                        min_plateau_length=min_plateau_length)
                 if slot_teeth:
                     slot_comb = unary_union(slot_teeth)
                     shapes[bottom_id] = shapes[bottom_id].difference(slot_comb)
@@ -637,7 +653,8 @@ def apply_finger_joints(
                 wall_teeth = _make_comb(wall_start, wall_end, tab_depth, finger_width,
                                         outward_wall,
                                         margin=edge_margin, exclusion_zones=wall_zones,
-                                        plateau_segments=shared_plateaus)
+                                        plateau_segments=shared_plateaus,
+                                        min_plateau_length=min_plateau_length)
                 if wall_teeth:
                     wall_comb = unary_union(wall_teeth)
                     shapes[fid] = shapes[fid].union(wall_comb)
