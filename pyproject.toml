@@ -1,0 +1,22 @@
+[project]
+name = "lasercut-generator"
+version = "0.1.0"
+description = "Generate laser-cut DXF/SVG files from STEP models with finger joints"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "cadquery>=2.7.0",
+    "cairosvg>=2.8.2",
+    "ezdxf>=1.4.3",
+    "shapely>=2.1.2",
+    "svgwrite>=1.4.3",
+]
+
+[project.scripts]
+lasercut = "lasercut.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
