@@ -11,6 +11,7 @@ from .finger_joints import (
     DEFAULT_NOTCH_BUFFER,
     DEFAULT_PLATEAU_INSET,
 )
+from .exporter import DEFAULT_FOLDED_OFFSET, DEFAULT_LAYOUT
 
 
 def main():
@@ -43,6 +44,10 @@ def main():
                         help=f"Inset from plateau boundaries in mm, -1 = auto ({DEFAULT_PLATEAU_INSET}mm)")
     parser.add_argument("--min-plateau-length", type=float, default=-1,
                         help=f"Minimum plateau segment length in mm, -1 = auto ({DEFAULT_MIN_PLATEAU_LENGTH}mm)")
+    parser.add_argument("--layout", choices=["folded", "packed"], default=DEFAULT_LAYOUT,
+                        help=f"Part layout mode (default: {DEFAULT_LAYOUT})")
+    parser.add_argument("--wall-offset", type=float, default=DEFAULT_FOLDED_OFFSET,
+                        help=f"Gap from bottom plate to surrounding walls in folded layout (default: {DEFAULT_FOLDED_OFFSET}mm)")
 
     args = parser.parse_args()
 
@@ -126,6 +131,9 @@ def main():
     print(f"  Notch buffer: {nb_display} mm")
     print(f"  Plateau inset: {pi_display} mm")
     print(f"  Min plateau length: {mpl_display} mm")
+    print(f"  Layout: {args.layout}")
+    if args.layout == "folded":
+        print(f"  Wall offset: {args.wall_offset} mm")
 
     modified_polygons, slot_cutouts = apply_finger_joints(
         projections, relevant_shared,
@@ -155,11 +163,13 @@ def main():
         print("Exporting DXF...")
         if args.per_face:
             dxf_files = export_dxf(projections, modified_polygons, args.output,
-                                   per_face=True, slot_cutouts=slot_cutouts)
+                                   per_face=True, slot_cutouts=slot_cutouts,
+                                   layout=args.layout, wall_offset=args.wall_offset)
         else:
             dxf_path = os.path.join(args.output, "lasercut.dxf")
             dxf_files = export_dxf(projections, modified_polygons, dxf_path,
-                                   slot_cutouts=slot_cutouts)
+                                   slot_cutouts=slot_cutouts,
+                                   layout=args.layout, wall_offset=args.wall_offset)
         written.extend(dxf_files)
         for f in dxf_files:
             print(f"  Written: {f}")
@@ -168,7 +178,8 @@ def main():
         print("Exporting SVG...")
         svg_path = os.path.join(args.output, "lasercut.svg")
         svg_file = export_svg(projections, modified_polygons, svg_path,
-                              slot_cutouts=slot_cutouts)
+                              slot_cutouts=slot_cutouts,
+                              layout=args.layout, wall_offset=args.wall_offset)
         written.append(svg_file)
         print(f"  Written: {svg_file}")
 
