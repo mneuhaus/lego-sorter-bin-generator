@@ -45,6 +45,10 @@ def _dot3(a: tuple, b: tuple) -> float:
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
 
+def _norm3(v: tuple[float, float, float]) -> float:
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
 def find_shared_edges(faces: list[PlanarFace], tol: float = 0.1) -> list[SharedEdge]:
     """Find edges shared between pairs of faces."""
     shared = []
@@ -77,7 +81,12 @@ def build_adjacency(faces: list[PlanarFace], shared_edges: list[SharedEdge]) -> 
     return adj
 
 
-def _find_opposite_pairs(faces: list[PlanarFace], tol: float = 0.05) -> dict[int, int]:
+def _find_opposite_pairs(
+    faces: list[PlanarFace],
+    tol: float = 0.05,
+    max_offset: float = 20.0,
+    max_lateral_offset: float = 20.0,
+) -> dict[int, int]:
     """Find pairs of faces with opposite normals and similar area (inner/outer of same panel).
 
     Returns mapping: face_id -> paired_face_id (only for the LARGER face of each pair).
@@ -91,6 +100,14 @@ def _find_opposite_pairs(faces: list[PlanarFace], tol: float = 0.05) -> dict[int
     for i, fa in enumerate(sorted_faces):
         if fa.face_id in used:
             continue
+
+        n_len = _norm3(fa.normal)
+        if n_len < 1e-12:
+            continue
+        n_hat = (fa.normal[0] / n_len, fa.normal[1] / n_len, fa.normal[2] / n_len)
+
+        best_candidate: tuple[float, int] | None = None
+
         for j, fb in enumerate(sorted_faces):
             if j <= i or fb.face_id in used:
                 continue
@@ -100,11 +117,32 @@ def _find_opposite_pairs(faces: list[PlanarFace], tol: float = 0.05) -> dict[int
                 # Normals are opposite; check area similarity (within 20%)
                 area_ratio = min(fa.area, fb.area) / max(fa.area, fb.area)
                 if area_ratio > 0.8:
-                    # fa is larger (sorted by area desc), fb is smaller (inner face)
-                    pairs[fa.face_id] = fb.face_id
-                    used.add(fa.face_id)
-                    used.add(fb.face_id)
-                    break
+                    # Also require spatial proximity so opposite walls on
+                    # different sides do not get mispaired as inner/outer.
+                    delta = (
+                        fb.center[0] - fa.center[0],
+                        fb.center[1] - fa.center[1],
+                        fb.center[2] - fa.center[2],
+                    )
+                    normal_proj = _dot3(delta, n_hat)
+                    normal_offset = abs(normal_proj)
+                    lateral = (
+                        delta[0] - normal_proj * n_hat[0],
+                        delta[1] - normal_proj * n_hat[1],
+                        delta[2] - normal_proj * n_hat[2],
+                    )
+                    lateral_offset = _norm3(lateral)
+
+                    if normal_offset <= max_offset and lateral_offset <= max_lateral_offset:
+                        score = normal_offset + 0.1 * lateral_offset
+                        if best_candidate is None or score < best_candidate[0]:
+                            best_candidate = (score, fb.face_id)
+
+        if best_candidate is not None:
+            _, match_id = best_candidate
+            pairs[fa.face_id] = match_id
+            used.add(fa.face_id)
+            used.add(match_id)
 
     return pairs
 
