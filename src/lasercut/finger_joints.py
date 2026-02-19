@@ -629,6 +629,13 @@ def apply_finger_joints(
                 # and incorrectly trigger full-edge finger placement.
                 if wall_plateaus and bottom_plateaus:
                     intersection = _intersect_segment_lists(wall_plateaus, bottom_plateaus)
+                    # Ignore degenerate overlaps that are too short to host even
+                    # one usable finger span, then fall back to wall plateaus.
+                    min_useful = max(finger_width * 0.5, min_plateau_length)
+                    intersection = [
+                        (s, e) for s, e in intersection
+                        if (e - s) * wall_edge_len >= min_useful - 1e-6
+                    ]
                     shared_plateaus = intersection if intersection else wall_plateaus
                 elif wall_plateaus:
                     shared_plateaus = wall_plateaus
