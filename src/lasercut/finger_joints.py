@@ -623,10 +623,13 @@ def apply_finger_joints(
                 bottom_plateaus = _find_plateau_segments(slot_start, slot_end, raw_shapes[bottom_id],
                                                          plateau_inset=plateau_inset)
 
-                # Use wall plateaus for both (wall is the notched face)
-                # No reversal needed since both are projected from the same 3D endpoints
+                # Prefer the wall's plateau map for through-slots.
+                # The bottom face can encode complementary valleys for the same
+                # geometric pattern, which would make a strict intersection empty
+                # and incorrectly trigger full-edge finger placement.
                 if wall_plateaus and bottom_plateaus:
-                    shared_plateaus = _intersect_segment_lists(wall_plateaus, bottom_plateaus)
+                    intersection = _intersect_segment_lists(wall_plateaus, bottom_plateaus)
+                    shared_plateaus = intersection if intersection else wall_plateaus
                 elif wall_plateaus:
                     shared_plateaus = wall_plateaus
                 elif bottom_plateaus:
