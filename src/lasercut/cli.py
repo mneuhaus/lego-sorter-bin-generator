@@ -164,12 +164,18 @@ def main():
         if args.per_face:
             dxf_files = export_dxf(projections, modified_polygons, args.output,
                                    per_face=True, slot_cutouts=slot_cutouts,
-                                   layout=args.layout, wall_offset=args.wall_offset)
+                                   layout=args.layout, wall_offset=args.wall_offset,
+                                   shared_edges=relevant_shared,
+                                   bottom_id=bottom.face_id,
+                                   faces=faces)
         else:
             dxf_path = os.path.join(args.output, "lasercut.dxf")
             dxf_files = export_dxf(projections, modified_polygons, dxf_path,
                                    slot_cutouts=slot_cutouts,
-                                   layout=args.layout, wall_offset=args.wall_offset)
+                                   layout=args.layout, wall_offset=args.wall_offset,
+                                   shared_edges=relevant_shared,
+                                   bottom_id=bottom.face_id,
+                                   faces=faces)
         written.extend(dxf_files)
         for f in dxf_files:
             print(f"  Written: {f}")
@@ -179,7 +185,10 @@ def main():
         svg_path = os.path.join(args.output, "lasercut.svg")
         svg_file = export_svg(projections, modified_polygons, svg_path,
                               slot_cutouts=slot_cutouts,
-                              layout=args.layout, wall_offset=args.wall_offset)
+                              layout=args.layout, wall_offset=args.wall_offset,
+                              shared_edges=relevant_shared,
+                              bottom_id=bottom.face_id,
+                              faces=faces)
         written.append(svg_file)
         print(f"  Written: {svg_file}")
 
