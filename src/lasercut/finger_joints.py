@@ -207,6 +207,24 @@ def _polygon_to_shapely(outer: list[tuple[float, float]],
     return Polygon(outer, hole_rings)
 
 
+def _simplify_ring(coords: list[tuple[float, float]], tol: float = 0.15) -> list[tuple[float, float]]:
+    """Remove degenerate micro-vertices that are closer than *tol* mm apart.
+
+    Preserves polygon topology by keeping every vertex whose removal would
+    collapse an edge to less than *tol*.
+    """
+    if len(coords) < 4:
+        return list(coords)
+    out: list[tuple[float, float]] = [coords[0]]
+    for pt in coords[1:]:
+        if _dist_2d(out[-1], pt) >= tol:
+            out.append(pt)
+    # Close the loop check: first vs last
+    if len(out) > 1 and _dist_2d(out[-1], out[0]) < tol:
+        out.pop()
+    return out if len(out) >= 3 else list(coords)
+
+
 def _shapely_to_vertices(geom) -> tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]:
     """Convert a Shapely geometry back to outer + inner vertex lists."""
     if geom.is_empty:
@@ -216,8 +234,8 @@ def _shapely_to_vertices(geom) -> tuple[list[tuple[float, float]], list[list[tup
         # Take the largest polygon
         geom = max(geom.geoms, key=lambda g: g.area)
 
-    outer = list(geom.exterior.coords[:-1])  # Shapely repeats the first point
-    inners = [list(ring.coords[:-1]) for ring in geom.interiors]
+    outer = _simplify_ring(list(geom.exterior.coords[:-1]))
+    inners = [_simplify_ring(list(ring.coords[:-1])) for ring in geom.interiors]
     return outer, inners
 
 
@@ -1005,6 +1023,21 @@ def apply_finger_joints(
                 if slot_teeth:
                     slot_comb = unary_union(slot_teeth)
                     shapes[bottom_id] = shapes[bottom_id].difference(slot_comb)
+
+                # Also cut outward from the through-slot line toward the polygon
+                # edge.  This turns internal-only holes into visible edge notches,
+                # making the through-slot positions clear in the unfolded SVG.
+                outward_bottom = (-inward[0], -inward[1])
+                edge_notch_teeth = _make_comb(
+                    slot_start, slot_end, thickness * 3, finger_width,
+                    outward_bottom,
+                    margin=edge_margin, exclusion_zones=None,
+                    tooth_intervals=shared_tooth_intervals,
+                    plateau_segments=shared_plateaus,
+                    min_plateau_length=min_plateau_length)
+                if edge_notch_teeth:
+                    edge_notch_comb = unary_union(edge_notch_teeth)
+                    shapes[bottom_id] = shapes[bottom_id].difference(edge_notch_comb)
 
                 # --- Tabs on the wall ---
                 wall_zones: list[Polygon] = []
