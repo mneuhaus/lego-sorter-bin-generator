@@ -7,7 +7,7 @@ This correctly handles corners, edge transitions, and complex polygon shapes.
 
 import math
 from dataclasses import dataclass
-from shapely.geometry import Point, Polygon, MultiPolygon, box
+from shapely.geometry import Point, Polygon, MultiPolygon, LineString, box
 from shapely.ops import unary_union
 from shapely import affinity
 
@@ -25,6 +25,9 @@ DEFAULT_NOTCH_BUFFER = 2.0
 DEFAULT_PLATEAU_INSET = 3.0
 # Minimum usable plateau segment length in mm.
 DEFAULT_MIN_PLATEAU_LENGTH = 12.0
+# Geometric cleanup radius (mm) for optional morphological open/close.
+# Keep at 0 by default to preserve original contours (especially rounded corners).
+DEFAULT_CLEANUP_RADIUS = 0.0
 
 
 def _dist_2d(a: tuple[float, float], b: tuple[float, float]) -> float:
@@ -150,6 +153,51 @@ def _edges_reversed(proj_a: 'Projection2D', edge_idx_a: int,
     return rev and not fwd
 
 
+def _build_tooth_intervals(
+    edge_len: float,
+    finger_width: float,
+    margin: float,
+    start_with_tooth: bool,
+    plateau_segments: list[tuple[float, float]] | None,
+    min_plateau_length: float,
+    force_odd_segments: bool = False,
+) -> list[tuple[float, float]]:
+    """Build parametric tooth intervals once, so both mating faces stay synchronized."""
+    if edge_len < 1e-6:
+        return []
+
+    margin_t = margin / edge_len if margin > 0 else 0.0
+    if plateau_segments:
+        segments = []
+        for seg_s, seg_e in plateau_segments:
+            eff_s = max(seg_s, margin_t)
+            eff_e = min(seg_e, 1.0 - margin_t)
+            if eff_e > eff_s + 1e-6:
+                segments.append((eff_s, eff_e))
+    else:
+        segments = [(margin_t, 1.0 - margin_t)]
+
+    intervals: list[tuple[float, float]] = []
+    start_idx = 0 if start_with_tooth else 1
+    for seg_s, seg_e in segments:
+        seg_len = (seg_e - seg_s) * edge_len
+        if plateau_segments:
+            min_len = max(finger_width * 0.5, min_plateau_length)
+        else:
+            min_len = finger_width * 0.5
+        if seg_len < min_len:
+            continue
+        n = _compute_n_fingers(seg_len, finger_width, margin=0)
+        if force_odd_segments and n % 2 == 0:
+            n += 1
+        for i in range(start_idx, n, 2):
+            t0 = seg_s + (i / n) * (seg_e - seg_s)
+            t1 = seg_s + ((i + 1) / n) * (seg_e - seg_s)
+            if t1 > t0 + 1e-9:
+                intervals.append((t0, t1))
+    return intervals
+
+
 def _polygon_to_shapely(outer: list[tuple[float, float]],
                         holes: list[list[tuple[float, float]]] | None = None) -> Polygon:
     """Convert vertex lists to a Shapely Polygon."""
@@ -199,6 +247,8 @@ def _make_comb(p1: tuple[float, float], p2: tuple[float, float],
                overlap: float = 0.01,
                exclusion_zones: list[Polygon] | None = None,
                cut_margins: bool = False,
+               start_with_tooth: bool = True,
+               tooth_intervals: list[tuple[float, float]] | None = None,
                plateau_segments: list[tuple[float, float]] | None = None,
                min_plateau_length: float = 0.0) -> list[Polygon]:
     """Create a list of rectangular 'teeth' along an edge.
@@ -257,9 +307,63 @@ def _make_comb(p1: tuple[float, float], p2: tuple[float, float],
             if rect.is_valid and rect.area > 0:
                 teeth.append(rect)
 
-    # Determine finger placement segments
+    if tooth_intervals is None:
+        tooth_intervals = _build_tooth_intervals(
+            edge_len=edge_len,
+            finger_width=finger_width,
+            margin=margin,
+            start_with_tooth=start_with_tooth,
+            plateau_segments=plateau_segments,
+            min_plateau_length=min_plateau_length,
+            force_odd_segments=False,
+        )
+
+    zone_union = unary_union(exclusion_zones) if exclusion_zones else None
+
+    for t0, t1 in tooth_intervals:
+        s0 = _lerp_2d(p1, p2, t0)
+        s1 = _lerp_2d(p1, p2, t1)
+
+        rect = Polygon([
+            (s0[0] - nx * overlap, s0[1] - ny * overlap),
+            (s1[0] - nx * overlap, s1[1] - ny * overlap),
+            (s1[0] + nx * depth, s1[1] + ny * depth),
+            (s0[0] + nx * depth, s0[1] + ny * depth),
+        ])
+        if not rect.is_valid or rect.area <= 0:
+            continue
+
+        if zone_union is not None:
+            blocked = rect.intersection(zone_union)
+            if not blocked.is_empty and blocked.area >= rect.area * 0.5:
+                continue
+
+        teeth.append(rect)
+
+    return teeth
+
+
+def _make_strip(p1: tuple[float, float], p2: tuple[float, float],
+                depth: float,
+                outward_dir: tuple[float, float],
+                margin: float = 0.0,
+                overlap: float = 0.01,
+                exclusion_zones: list[Polygon] | None = None,
+                plateau_segments: list[tuple[float, float]] | None = None,
+                min_plateau_length: float = 0.0) -> list[Polygon]:
+    """Create full-width strip rectangles along an edge segment set.
+
+    Used to inset a positive-joint edge inward by `depth` before adding tabs
+    back, so overall outer dimensions are preserved.
+    """
+    strips = []
+    nx, ny = outward_dir
+    edge_len = _dist_2d(p1, p2)
+    if edge_len < 1e-6:
+        return strips
+
+    margin_t = margin / edge_len if margin > 0 else 0.0
     if plateau_segments:
-        # Place fingers within each plateau, clamped to margin
         segments = []
         for seg_s, seg_e in plateau_segments:
             eff_s = max(seg_s, margin_t)
@@ -267,41 +371,125 @@ def _make_comb(p1: tuple[float, float], p2: tuple[float, float],
             if eff_e > eff_s + 1e-6:
                 segments.append((eff_s, eff_e))
     else:
-        # Full edge within margin is one segment
         segments = [(margin_t, 1.0 - margin_t)]
 
     for seg_s, seg_e in segments:
         seg_len = (seg_e - seg_s) * edge_len
-        if plateau_segments:
-            min_len = max(finger_width * 0.5, min_plateau_length)
-        else:
-            min_len = finger_width * 0.5
+        min_len = max(min_plateau_length, 1e-3)
         if seg_len < min_len:
             continue
-        n = _compute_n_fingers(seg_len, finger_width, margin=0)
 
-        for i in range(0, n, 2):  # Even segments = teeth
-            t0 = seg_s + (i / n) * (seg_e - seg_s)
-            t1 = seg_s + ((i + 1) / n) * (seg_e - seg_s)
-            s0 = _lerp_2d(p1, p2, t0)
-            s1 = _lerp_2d(p1, p2, t1)
+        s0 = _lerp_2d(p1, p2, seg_s)
+        s1 = _lerp_2d(p1, p2, seg_e)
+        rect = Polygon([
+            (s0[0] - nx * overlap, s0[1] - ny * overlap),
+            (s1[0] - nx * overlap, s1[1] - ny * overlap),
+            (s1[0] + nx * depth, s1[1] + ny * depth),
+            (s0[0] + nx * depth, s0[1] + ny * depth),
+        ])
+        if not rect.is_valid or rect.area <= 0:
+            continue
+        if exclusion_zones and any(rect.intersects(z) for z in exclusion_zones):
+            continue
+        strips.append(rect)
 
-            rect = Polygon([
-                (s0[0] - nx * overlap, s0[1] - ny * overlap),
-                (s1[0] - nx * overlap, s1[1] - ny * overlap),
-                (s1[0] + nx * depth, s1[1] + ny * depth),
-                (s0[0] + nx * depth, s0[1] + ny * depth),
-            ])
-            if not rect.is_valid or rect.area <= 0:
-                continue
+    return strips
 
-            if exclusion_zones:
-                if any(rect.intersects(z) for z in exclusion_zones):
-                    continue
 
-            teeth.append(rect)
+def _filter_tooth_intervals_by_zones(
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    depth: float,
+    outward_dir: tuple[float, float],
+    tooth_intervals: list[tuple[float, float]],
+    exclusion_zones: list[Polygon] | None,
+    overlap: float = 0.01,
+) -> list[tuple[float, float]]:
+    """Filter tooth intervals whose rectangles intersect exclusion zones.
 
-    return teeth
+    Keeps tab/slot interval phasing symmetric while avoiding cuts that would
+    intrude into protected neighboring seam regions.
+    """
+    if not tooth_intervals or not exclusion_zones:
+        return tooth_intervals
+
+    nx, ny = outward_dir
+    kept: list[tuple[float, float]] = []
+    for t0, t1 in tooth_intervals:
+        s0 = _lerp_2d(p1, p2, t0)
+        s1 = _lerp_2d(p1, p2, t1)
+        rect = Polygon([
+            (s0[0] - nx * overlap, s0[1] - ny * overlap),
+            (s1[0] - nx * overlap, s1[1] - ny * overlap),
+            (s1[0] + nx * depth, s1[1] + ny * depth),
+            (s0[0] + nx * depth, s0[1] + ny * depth),
+        ])
+        if not rect.is_valid or rect.area <= 0:
+            continue
+        if any(rect.intersects(z) for z in exclusion_zones):
+            continue
+        kept.append((t0, t1))
+    return kept
+
+
+def _filter_tooth_intervals_by_dual_zones(
+    p1_a: tuple[float, float],
+    p2_a: tuple[float, float],
+    depth_a: float,
+    outward_a: tuple[float, float],
+    zones_a: list[Polygon] | None,
+    p1_b: tuple[float, float],
+    p2_b: tuple[float, float],
+    depth_b: float,
+    outward_b: tuple[float, float],
+    zones_b: list[Polygon] | None,
+    tooth_intervals: list[tuple[float, float]],
+    overlap: float = 0.01,
+) -> list[tuple[float, float]]:
+    """Filter intervals that are valid on both mating faces.
+
+    Used for through-slot joints so we preserve tab/slot complement while also
+    keeping the pattern away from protected seam regions on both faces.
+    """
+    if not tooth_intervals:
+        return tooth_intervals
+
+    zones_a = zones_a or []
+    zones_b = zones_b or []
+    if not zones_a and not zones_b:
+        return tooth_intervals
+
+    nax, nay = outward_a
+    nbx, nby = outward_b
+    kept: list[tuple[float, float]] = []
+    for t0, t1 in tooth_intervals:
+        sa0 = _lerp_2d(p1_a, p2_a, t0)
+        sa1 = _lerp_2d(p1_a, p2_a, t1)
+        sb0 = _lerp_2d(p1_b, p2_b, t0)
+        sb1 = _lerp_2d(p1_b, p2_b, t1)
+
+        rect_a = Polygon([
+            (sa0[0] - nax * overlap, sa0[1] - nay * overlap),
+            (sa1[0] - nax * overlap, sa1[1] - nay * overlap),
+            (sa1[0] + nax * depth_a, sa1[1] + nay * depth_a),
+            (sa0[0] + nax * depth_a, sa0[1] + nay * depth_a),
+        ])
+        rect_b = Polygon([
+            (sb0[0] - nbx * overlap, sb0[1] - nby * overlap),
+            (sb1[0] - nbx * overlap, sb1[1] - nby * overlap),
+            (sb1[0] + nbx * depth_b, sb1[1] + nby * depth_b),
+            (sb0[0] + nbx * depth_b, sb0[1] + nby * depth_b),
+        ])
+        if (not rect_a.is_valid or rect_a.area <= 0 or
+                not rect_b.is_valid or rect_b.area <= 0):
+            continue
+        if zones_a and any(rect_a.intersects(z) for z in zones_a):
+            continue
+        if zones_b and any(rect_b.intersects(z) for z in zones_b):
+            continue
+        kept.append((t0, t1))
+
+    return kept
 
 
 def _outward_direction(p1: tuple[float, float], p2: tuple[float, float],
@@ -318,29 +506,37 @@ def _outward_direction(p1: tuple[float, float], p2: tuple[float, float],
     n2 = (dy / length, -dx / length)
 
     mid = ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+
+    # Robust side test: for a boundary edge, one side is inside the polygon
+    # and the opposite side is outside. This avoids centroid-heuristic errors
+    # on concave/irregular outlines.
+    probe = min(1.0, max(0.2, length * 0.01))
+    test1 = Point(mid[0] + n1[0] * probe, mid[1] + n1[1] * probe)
+    test2 = Point(mid[0] + n2[0] * probe, mid[1] + n2[1] * probe)
+    inside1 = polygon.buffer(1e-9).contains(test1)
+    inside2 = polygon.buffer(1e-9).contains(test2)
+    if inside1 and not inside2:
+        return n2
+    if inside2 and not inside1:
+        return n1
+
+    # Fallback when probing is ambiguous (near corners / noisy geometry).
     centroid = polygon.centroid
-
-    test1 = (mid[0] + n1[0], mid[1] + n1[1])
-    test2 = (mid[0] + n2[0], mid[1] + n2[1])
-
-    d1 = (test1[0] - centroid.x)**2 + (test1[1] - centroid.y)**2
-    d2 = (test2[0] - centroid.x)**2 + (test2[1] - centroid.y)**2
-
+    d1 = (test1.x - centroid.x) ** 2 + (test1.y - centroid.y) ** 2
+    d2 = (test2.x - centroid.x) ** 2 + (test2.y - centroid.y) ** 2
     return n1 if d1 > d2 else n2
 
 
 def _compute_n_fingers(edge_len: float, finger_width: float, margin: float = 0.0) -> int:
-    """Compute number of finger segments (always odd for symmetry, >= 3).
+    """Compute number of finger segments (>= 2).
 
     Uses the usable length (edge_len - 2*margin) for finger count calculation.
     """
     usable = edge_len - 2 * margin
     if usable <= 0:
-        return 3
+        return 2
     n = max(1, round(usable / finger_width))
-    if n % 2 == 0:
-        n += 1
-    return max(3, n)
+    return max(2, n)
 
 
 def _find_bottom_edge_endpoints(wall: PlanarFace, bottom: PlanarFace, tol: float = 5.0):
@@ -403,6 +599,8 @@ def apply_finger_joints(
     min_plateau_length: float = -1,
     faces: list[PlanarFace] | None = None,
     all_shared_edges: list[SharedEdge] | None = None,
+    preserve_outer_dims: bool = True,
+    cleanup_radius: float = DEFAULT_CLEANUP_RADIUS,
 ) -> tuple[dict[int, list[tuple[float, float]]], dict[int, list[list[tuple[float, float]]]]]:
     """Apply finger joints using Shapely boolean operations.
 
@@ -442,25 +640,35 @@ def apply_finger_joints(
     for fid, proj in projections.items():
         shape = _polygon_to_shapely(proj.outer_polygon, proj.inner_polygons)
         raw_shapes[fid] = shape
-        # Morphological smoothing to remove 3D-model ledge artifacts.
-        # Use 1.5x thickness to cover ledges slightly deeper than nominal.
-        close_dist = thickness * 1.5
-        if fid == bottom_id:
-            # Bottom plate: closing (fills notch indentations from wall ledges)
-            closed = shape.buffer(close_dist, join_style='mitre').buffer(-close_dist, join_style='mitre')
-        else:
-            # Walls: opening (removes ledge protrusions where wall sits on bottom)
-            closed = shape.buffer(-close_dist, join_style='mitre').buffer(close_dist, join_style='mitre')
-        if not closed.is_empty and closed.is_valid:
-            if isinstance(closed, MultiPolygon):
-                closed = max(closed.geoms, key=lambda g: g.area)
-            shape = closed
+        # Optional, conservative morphological cleanup.
+        # Disabled by default to preserve true outer contours/radii.
+        if cleanup_radius > 1e-6:
+            if fid == bottom_id:
+                # Bottom plate: closing (fills tiny inward artifacts)
+                closed = shape.buffer(cleanup_radius, join_style='round').buffer(-cleanup_radius, join_style='round')
+            else:
+                # Walls: opening (removes tiny outward artifacts)
+                closed = shape.buffer(-cleanup_radius, join_style='round').buffer(cleanup_radius, join_style='round')
+            if not closed.is_empty and closed.is_valid:
+                if isinstance(closed, MultiPolygon):
+                    closed = max(closed.geoms, key=lambda g: g.area)
+                shape = closed
         shapes[fid] = shape
 
     # Build exclusion zones from inner polygons (notches/holes) for each face
     exclusion_zones: dict[int, list[Polygon]] = {}
     for fid, proj in projections.items():
         exclusion_zones[fid] = _build_exclusion_zones(proj, notch_buffer)
+
+    # Faces directly adjacent to the bottom. Used to orient wall-to-wall joints
+    # so non-bottom-adjacent walls (e.g. stepped/notched back walls) are expanded
+    # toward the box interior while bottom-adjacent side walls are cut inward.
+    bottom_adjacent: set[int] = set()
+    for se in shared_edges:
+        if se.face_a_id == bottom_id:
+            bottom_adjacent.add(se.face_b_id)
+        elif se.face_b_id == bottom_id:
+            bottom_adjacent.add(se.face_a_id)
 
     # Apply finger joints along shared edges
     for se in shared_edges:
@@ -471,13 +679,34 @@ def apply_finger_joints(
             continue
 
         # Determine positive/negative
+        # Keep historical orientation for matching wall-to-wall patterns.
+        # Outer-dimension preservation is handled separately via strip-inset logic.
         if fid_a == bottom_id:
             pos_id, neg_id = fid_a, fid_b
         elif fid_b == bottom_id:
             pos_id, neg_id = fid_b, fid_a
         else:
-            pos_id = min(fid_a, fid_b)
-            neg_id = max(fid_a, fid_b)
+            # For wall-to-wall joints, if one wall is bottom-adjacent and the
+            # other is not, keep the non-bottom-adjacent wall positive. This is
+            # the original pairing convention and yields matching edge phasing.
+            a_adj = fid_a in bottom_adjacent
+            b_adj = fid_b in bottom_adjacent
+            if a_adj != b_adj:
+                pos_id = fid_a if not a_adj else fid_b
+                neg_id = fid_b if pos_id == fid_a else fid_a
+            else:
+                pos_id = min(fid_a, fid_b)
+                neg_id = max(fid_a, fid_b)
+
+        # Keep outer-dimension preservation focused on bottom-wall joints.
+        # Applying the inset on generic wall-wall edges can interfere with
+        # later through-slot tab generation on those same walls.
+        is_bottom_pair = (fid_a == bottom_id or fid_b == bottom_id)
+        preserve_on_this_pair = preserve_outer_dims and is_bottom_pair
+        # Start shared joints on a tooth interval so the wall-side profile
+        # begins with a slot near corners, reducing visible endpoint ledges
+        # in unfolded seam previews.
+        start_with_tooth = True
 
         # Find the matching 2D edges on both faces
         pos_proj = projections[pos_id]
@@ -505,23 +734,18 @@ def apply_finger_joints(
 
         # Determine shared plateau segments (so tabs and slots align)
         # If both faces have no notches (empty plateaus), use default full-edge
+        reversed_edge = _edges_reversed(pos_proj, pos_edge_idx, neg_proj, neg_edge_idx)
         if pos_plateaus and neg_plateaus:
             # Both have notches: intersect, accounting for possible edge reversal
-            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx,
-                                            neg_proj, neg_edge_idx)
             neg_in_pos_space = _reverse_segments(neg_plateaus) if reversed_edge else neg_plateaus
             shared_pos = _intersect_segment_lists(pos_plateaus, neg_in_pos_space)
             shared_neg = _reverse_segments(shared_pos) if reversed_edge else shared_pos
         elif pos_plateaus:
             # Only positive face has notches: use its plateaus for both
-            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx,
-                                            neg_proj, neg_edge_idx)
             shared_pos = pos_plateaus
             shared_neg = _reverse_segments(pos_plateaus) if reversed_edge else pos_plateaus
         elif neg_plateaus:
             # Only negative face has notches: use its plateaus for both
-            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx,
-                                            neg_proj, neg_edge_idx)
             shared_neg = neg_plateaus
             shared_pos = _reverse_segments(neg_plateaus) if reversed_edge else neg_plateaus
         else:
@@ -529,28 +753,97 @@ def apply_finger_joints(
             shared_pos = []
             shared_neg = []
 
+        # Build tooth intervals once in parametric edge space and reuse them
+        # on both faces (mirrored when edge directions are opposite).
+        tooth_pos = _build_tooth_intervals(
+            edge_len=pos_edge_len,
+            finger_width=finger_width,
+            margin=edge_margin,
+            start_with_tooth=start_with_tooth,
+            plateau_segments=shared_pos,
+            min_plateau_length=min_plateau_length,
+            force_odd_segments=True,
+        )
+        tooth_neg = _reverse_segments(tooth_pos) if reversed_edge else list(tooth_pos)
+
         # Process both faces
         for face_id, is_positive, p1, p2, plateaus in [
             (pos_id, True, pos_p1, pos_p2, shared_pos),
             (neg_id, False, neg_p1, neg_p2, shared_neg),
         ]:
             outward = _outward_direction(p1, p2, shapes[face_id])
-            depth = thickness + kerf_half if is_positive else thickness - kerf_half
+            depth = thickness
             if depth <= 0:
                 continue
 
-            zones = exclusion_zones.get(face_id, [])
+            # Keep paired joints strictly complementary: do not apply per-face
+            # exclusion filtering here, otherwise one side may drop a tooth
+            # while the mating side keeps it.
+            zones: list[Polygon] = []
 
             if is_positive:
-                teeth = _make_comb(p1, p2, depth, finger_width, outward,
-                                   margin=edge_margin, exclusion_zones=zones,
-                                   plateau_segments=plateaus,
-                                   min_plateau_length=min_plateau_length)
+                if preserve_on_this_pair:
+                    # Inset the edge inward by one thickness and then add tabs
+                    # back from the inset line to the original line. This keeps
+                    # the outer contour envelope unchanged.
+                    inward = (-outward[0], -outward[1])
+                    strips = _make_strip(
+                        p1, p2, depth, inward,
+                        # Inset across the full edge to avoid corner step lips
+                        # at margin boundaries where adjacent seams meet.
+                        margin=0.0,
+                        exclusion_zones=zones,
+                        plateau_segments=plateaus,
+                        min_plateau_length=min_plateau_length,
+                    )
+                    if strips:
+                        shapes[face_id] = shapes[face_id].difference(unary_union(strips))
+                    sp1 = (p1[0] + inward[0] * depth, p1[1] + inward[1] * depth)
+                    sp2 = (p2[0] + inward[0] * depth, p2[1] + inward[1] * depth)
+                    margin_fills: list[Polygon] = []
+                    edge_len = _dist_2d(p1, p2)
+                    if edge_margin > 0 and edge_len > 1e-6:
+                        margin_t = min(0.5, edge_margin / edge_len)
+                        # Fill dead-zones at both seam ends back to the original
+                        # contour so preserve-mode does not leave L-shaped lips.
+                        for t0, t1 in ((0.0, margin_t), (1.0 - margin_t, 1.0)):
+                            if t1 <= t0 + 1e-9:
+                                continue
+                            s0 = _lerp_2d(sp1, sp2, t0)
+                            s1 = _lerp_2d(sp1, sp2, t1)
+                            fill = Polygon([
+                                (s0[0], s0[1]),
+                                (s1[0], s1[1]),
+                                (s1[0] + outward[0] * depth, s1[1] + outward[1] * depth),
+                                (s0[0] + outward[0] * depth, s0[1] + outward[1] * depth),
+                            ])
+                            if fill.is_valid and fill.area > 0:
+                                margin_fills.append(fill)
+                    teeth = _make_comb(
+                        sp1, sp2, depth, finger_width, outward,
+                        margin=edge_margin,
+                        exclusion_zones=zones,
+                        start_with_tooth=start_with_tooth,
+                        tooth_intervals=tooth_pos,
+                        plateau_segments=plateaus,
+                        min_plateau_length=min_plateau_length,
+                    )
+                    if margin_fills:
+                        teeth.extend(margin_fills)
+                else:
+                    teeth = _make_comb(p1, p2, depth, finger_width, outward,
+                                       margin=edge_margin, exclusion_zones=zones,
+                                       start_with_tooth=start_with_tooth,
+                                       tooth_intervals=tooth_pos,
+                                       plateau_segments=plateaus,
+                                       min_plateau_length=min_plateau_length)
             else:
                 inward = (-outward[0], -outward[1])
                 teeth = _make_comb(p1, p2, depth, finger_width, inward,
                                    margin=edge_margin, exclusion_zones=zones,
-                                   cut_margins=True,
+                                   cut_margins=False,
+                                   start_with_tooth=start_with_tooth,
+                                   tooth_intervals=tooth_neg,
                                    plateau_segments=plateaus,
                                    min_plateau_length=min_plateau_length)
 
@@ -577,7 +870,55 @@ def apply_finger_joints(
                 elif se.face_b_id == bottom_id:
                     bottom_adjacent.add(se.face_a_id)
 
-            bottom_zones = exclusion_zones.get(bottom_id, [])
+            bottom_proj = projections[bottom_id]
+            protected_bottom_joint_zones: list[Polygon] = []
+            protect_dist = max(0.5, notch_buffer) + max(0.0, thickness)
+            # Keep through-slot cuts away from direct bottom-wall seam edges.
+            for se in shared_edges:
+                if se.face_a_id == bottom_id:
+                    other = se.face_b_id
+                elif se.face_b_id == bottom_id:
+                    other = se.face_a_id
+                else:
+                    continue
+                if other not in bottom_adjacent:
+                    continue
+                edge_idx = _find_matching_edge_index(bottom_proj, se)
+                if edge_idx is None:
+                    continue
+                ep1, ep2 = bottom_proj.outer_edges_2d[edge_idx]
+                zone = LineString([ep1, ep2]).buffer(protect_dist)
+                if not zone.is_empty:
+                    protected_bottom_joint_zones.append(zone)
+
+            # Protect wall-to-wall seam edges from through-slot tab additions.
+            protected_wall_joint_zones: dict[int, list[Polygon]] = {}
+            for fid, proj in projections.items():
+                if fid == bottom_id:
+                    continue
+                zones: list[Polygon] = []
+                for se in shared_edges:
+                    if se.face_a_id == fid:
+                        other = se.face_b_id
+                    elif se.face_b_id == fid:
+                        other = se.face_a_id
+                    else:
+                        continue
+                    # Through-slot shaping must not disturb bottom-facing seams
+                    # on neighboring walls.
+                    if other == bottom_id or other not in projections:
+                        continue
+                    edge_idx = _find_matching_edge_index(proj, se)
+                    if edge_idx is None:
+                        continue
+                    ep1, ep2 = proj.outer_edges_2d[edge_idx]
+                    zone = LineString([ep1, ep2]).buffer(protect_dist)
+                    if not zone.is_empty:
+                        zones.append(zone)
+                protected_wall_joint_zones[fid] = zones
+
+            # Through-slot tabs/slots must stay symmetric as a pair.
+            bottom_zones: list[Polygon] = protected_bottom_joint_zones
 
             for fid, proj in projections.items():
                 if fid == bottom_id or fid in bottom_adjacent:
@@ -594,7 +935,6 @@ def apply_finger_joints(
                 p_start_3d, p_end_3d = endpoints
 
                 # --- Through-slots on the bottom plate ---
-                bottom_proj = projections[bottom_id]
                 slot_start = _project_point(p_start_3d, bottom_proj.origin_3d,
                                             bottom_proj.u_axis, bottom_proj.v_axis)
                 slot_end = _project_point(p_end_3d, bottom_proj.origin_3d,
@@ -606,7 +946,7 @@ def apply_finger_joints(
                 inward = _outward_direction(slot_start, slot_end, shapes[bottom_id])
                 inward = (-inward[0], -inward[1])
 
-                slot_depth = thickness + kerf_half
+                slot_depth = thickness
 
                 # Detect plateaus on the wall face for this edge
                 wall_proj = projections[fid]
@@ -644,8 +984,22 @@ def apply_finger_joints(
                 else:
                     shared_plateaus = []
 
+                shared_tooth_intervals = _build_tooth_intervals(
+                    edge_len=slot_len,
+                    finger_width=finger_width,
+                    margin=edge_margin,
+                    start_with_tooth=False,
+                    plateau_segments=shared_plateaus,
+                    min_plateau_length=min_plateau_length,
+                    force_odd_segments=True,
+                )
+                # Keep through-slot tooth phasing unfragmented. Filtering these
+                # intervals by protection zones can create tiny seam artifacts
+                # at interval boundaries.
+
                 slot_teeth = _make_comb(slot_start, slot_end, slot_depth, finger_width, inward,
-                                        margin=edge_margin, exclusion_zones=bottom_zones,
+                                        margin=edge_margin, exclusion_zones=None,
+                                        tooth_intervals=shared_tooth_intervals,
                                         plateau_segments=shared_plateaus,
                                         min_plateau_length=min_plateau_length)
                 if slot_teeth:
@@ -653,21 +1007,43 @@ def apply_finger_joints(
                     shapes[bottom_id] = shapes[bottom_id].difference(slot_comb)
 
                 # --- Tabs on the wall ---
-                wall_zones = exclusion_zones.get(fid, [])
+                wall_zones: list[Polygon] = []
                 outward_wall = _outward_direction(wall_start, wall_end, shapes[fid])
+                wall_zones = protected_wall_joint_zones.get(fid, [])
 
-                tab_depth = thickness - kerf_half
+                tab_depth = thickness
                 if tab_depth <= 0:
                     continue
 
+                # Keep through-slot tab intervals synchronized with bottom slots.
+                # Use exclusion zones at geometry stage (below) instead of
+                # dropping parametric intervals asymmetrically.
+
+                # Through-slot walls must keep real protruding tabs so they can
+                # enter bottom slots. Do not inset/flush them for outer-dim mode.
                 wall_teeth = _make_comb(wall_start, wall_end, tab_depth, finger_width,
                                         outward_wall,
                                         margin=edge_margin, exclusion_zones=wall_zones,
+                                        tooth_intervals=shared_tooth_intervals,
                                         plateau_segments=shared_plateaus,
                                         min_plateau_length=min_plateau_length)
                 if wall_teeth:
                     wall_comb = unary_union(wall_teeth)
                     shapes[fid] = shapes[fid].union(wall_comb)
+
+    # Apply kerf compensation as contour offset:
+    # - Positive kerf expands exterior boundaries and contracts holes,
+    #   yielding nominal cut dimensions after material removal.
+    # - Negative kerf does the inverse (sometimes used for looser fits).
+    if abs(kerf_half) > 1e-9:
+        for fid, shape in list(shapes.items()):
+            compensated = shape.buffer(kerf_half, join_style='mitre')
+            if compensated.is_empty:
+                continue
+            if isinstance(compensated, MultiPolygon):
+                compensated = max(compensated.geoms, key=lambda g: g.area)
+            if compensated.is_valid and not compensated.is_empty:
+                shapes[fid] = compensated
 
     # Convert Shapely geometries back to vertex lists
     modified: dict[int, list[tuple[float, float]]] = {}
