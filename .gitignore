@@ -11,6 +11,10 @@ wheels/
 
 # Generated output
 output/
+output-rs/
+
+# Rust build artifacts
+lasercut-rs/target/
 
 # Local agent/session metadata
 .claude/
