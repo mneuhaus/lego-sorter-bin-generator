@@ -56,8 +56,148 @@ def _dist_2d(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
 
 
+def _polygon_signed_area(points: list[tuple[float, float]]) -> float:
+    """Signed area of a polygon ring (positive for CCW winding)."""
+    if len(points) < 3:
+        return 0.0
+    area2 = 0.0
+    n = len(points)
+    for i in range(n):
+        x1, y1 = points[i]
+        x2, y2 = points[(i + 1) % n]
+        area2 += x1 * y2 - x2 * y1
+    return 0.5 * area2
+
+
 def _lerp_2d(a: tuple[float, float], b: tuple[float, float], t: float) -> tuple[float, float]:
     return (a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1]))
+
+
+def _corner_endpoint_keepouts(
+    proj: Projection2D,
+    edge_idx: int,
+    depth: float,
+    max_factor: float = 2.5,
+) -> tuple[float, float]:
+    """Compute corner-safe start/end clearances for one outer edge.
+
+    For convex corners, a rectangular tooth of depth `depth` should start/end
+    at least `depth * cot(interior_angle/2)` from the vertex to avoid tiny
+    miter artifacts where neighboring edge features overlap.
+    """
+    verts = proj.outer_polygon
+    n = len(verts)
+    if n < 3 or depth <= 1e-9:
+        return 0.0, 0.0
+
+    is_ccw = _polygon_signed_area(verts) >= 0
+
+    def _keepout(prev_pt: tuple[float, float], curr_pt: tuple[float, float], next_pt: tuple[float, float]) -> float:
+        in_vec = (curr_pt[0] - prev_pt[0], curr_pt[1] - prev_pt[1])
+        out_vec = (next_pt[0] - curr_pt[0], next_pt[1] - curr_pt[1])
+
+        in_len = math.hypot(in_vec[0], in_vec[1])
+        out_len = math.hypot(out_vec[0], out_vec[1])
+        if in_len < 1e-9 or out_len < 1e-9:
+            return 0.0
+
+        in_u = (in_vec[0] / in_len, in_vec[1] / in_len)
+        out_u = (out_vec[0] / out_len, out_vec[1] / out_len)
+
+        turn = in_u[0] * out_u[1] - in_u[1] * out_u[0]
+        is_convex = turn > 1e-9 if is_ccw else turn < -1e-9
+        if not is_convex:
+            return 0.0
+
+        dot = max(-1.0, min(1.0, in_u[0] * out_u[0] + in_u[1] * out_u[1]))
+        interior = math.acos(dot)
+        if interior <= 1e-6 or interior >= math.pi - 1e-6:
+            return 0.0
+
+        # depth * cot(interior/2)
+        half = interior * 0.5
+        tan_half = math.tan(half)
+        if abs(tan_half) < 1e-9:
+            return 0.0
+
+        keepout = depth / tan_half
+        if keepout < 0:
+            return 0.0
+        return min(keepout, depth * max_factor)
+
+    def _keepout_at_vertex(i: int) -> float:
+        i_prev = (i - 1) % n
+        i_next = (i + 1) % n
+        return _keepout(verts[i_prev], verts[i], verts[i_next])
+
+    i0 = edge_idx % n
+    i1 = (edge_idx + 1) % n
+    start_keepout = _keepout_at_vertex(i0)
+    end_keepout = _keepout_at_vertex(i1)
+    return start_keepout, end_keepout
+
+
+def _corner_keepouts_near_points(
+    proj: Projection2D,
+    start_pt: tuple[float, float],
+    end_pt: tuple[float, float],
+    depth: float,
+    tol: float = 6.0,
+    max_factor: float = 2.5,
+) -> tuple[float, float]:
+    """Corner keepouts using nearest outer vertices to two arbitrary endpoints."""
+    verts = proj.outer_polygon
+    n = len(verts)
+    if n < 3 or depth <= 1e-9:
+        return 0.0, 0.0
+
+    def nearest_idx(pt: tuple[float, float]) -> int | None:
+        best_i = None
+        best_d = float("inf")
+        for i, v in enumerate(verts):
+            d = _dist_2d(pt, v)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        if best_i is None or best_d > tol:
+            return None
+        return best_i
+
+    is_ccw = _polygon_signed_area(verts) >= 0
+
+    def keepout_at(i: int) -> float:
+        i_prev = (i - 1) % n
+        i_next = (i + 1) % n
+        prev_pt = verts[i_prev]
+        curr_pt = verts[i]
+        next_pt = verts[i_next]
+
+        in_vec = (curr_pt[0] - prev_pt[0], curr_pt[1] - prev_pt[1])
+        out_vec = (next_pt[0] - curr_pt[0], next_pt[1] - curr_pt[1])
+        in_len = math.hypot(in_vec[0], in_vec[1])
+        out_len = math.hypot(out_vec[0], out_vec[1])
+        if in_len < 1e-9 or out_len < 1e-9:
+            return 0.0
+        in_u = (in_vec[0] / in_len, in_vec[1] / in_len)
+        out_u = (out_vec[0] / out_len, out_vec[1] / out_len)
+        turn = in_u[0] * out_u[1] - in_u[1] * out_u[0]
+        is_convex = turn > 1e-9 if is_ccw else turn < -1e-9
+        if not is_convex:
+            return 0.0
+        dot = max(-1.0, min(1.0, in_u[0] * out_u[0] + in_u[1] * out_u[1]))
+        interior = math.acos(dot)
+        if interior <= 1e-6 or interior >= math.pi - 1e-6:
+            return 0.0
+        tan_half = math.tan(0.5 * interior)
+        if abs(tan_half) < 1e-9:
+            return 0.0
+        return min(max(0.0, depth / tan_half), depth * max_factor)
+
+    start_i = nearest_idx(start_pt)
+    end_i = nearest_idx(end_pt)
+    start_keepout = keepout_at(start_i) if start_i is not None else 0.0
+    end_keepout = keepout_at(end_i) if end_i is not None else 0.0
+    return start_keepout, end_keepout
 
 
 def _find_plateau_segments(p1: tuple[float, float], p2: tuple[float, float],
@@ -214,6 +354,21 @@ def _find_matching_edge_index(proj: Projection2D, shared_edge: SharedEdge) -> in
             if fwd or rev:
                 return idx
 
+    return None
+
+
+def _find_edge_index_by_endpoints(
+    proj: Projection2D,
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    tol: float = 0.5,
+) -> int | None:
+    """Find a projected outer edge index by 2D endpoints (either orientation)."""
+    for idx, (a, b) in enumerate(proj.outer_edges_2d):
+        fwd = _dist_2d(a, p1) <= tol and _dist_2d(b, p2) <= tol
+        rev = _dist_2d(a, p2) <= tol and _dist_2d(b, p1) <= tol
+        if fwd or rev:
+            return idx
     return None
 
 
@@ -868,27 +1023,33 @@ def _build_fusion_intervals_for_segments(
     params: FusionJointParams,
     segments_t: list[tuple[float, float]] | None = None,
     margin: float = 0.0,
+    start_margin: float | None = None,
+    end_margin: float | None = None,
     min_segment_length: float = 0.0,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]] | None:
     """Build Fusion-style intervals on one or more parametric edge segments."""
     if edge_len <= 1e-9:
         return None
 
-    margin_t = max(0.0, margin / edge_len) if margin > 0 else 0.0
-    margin_t = min(margin_t, 0.49)
+    start_m = margin if start_margin is None else start_margin
+    end_m = margin if end_margin is None else end_margin
+    start_t = max(0.0, start_m / edge_len) if start_m > 0 else 0.0
+    end_t = max(0.0, end_m / edge_len) if end_m > 0 else 0.0
+    start_t = min(start_t, 0.49)
+    end_t = min(end_t, 0.49)
+    if start_t + end_t >= 1.0 - 1e-6:
+        return None
 
     if segments_t:
         segments: list[tuple[float, float]] = []
         for s, e in segments_t:
-            s2 = max(s, margin_t)
-            e2 = min(e, 1.0 - margin_t)
+            s2 = max(s, start_t)
+            e2 = min(e, 1.0 - end_t)
             seg_len = (e2 - s2) * edge_len
             if seg_len >= max(1e-6, min_segment_length):
                 segments.append((s2, e2))
     else:
-        if 1.0 - margin_t <= margin_t + 1e-6:
-            return None
-        segments = [(margin_t, 1.0 - margin_t)]
+        segments = [(start_t, 1.0 - end_t)]
 
     finger_intervals: list[tuple[float, float]] = []
     slot_intervals: list[tuple[float, float]] = []
@@ -1028,6 +1189,14 @@ def apply_finger_joints_fusion(
         neg_p1, neg_p2 = neg_proj.outer_edges_2d[neg_edge_idx]
         pos_len = _dist_2d(pos_p1, pos_p2)
         neg_len = _dist_2d(neg_p1, neg_p2)
+        pos_depth = thickness + kerf_half
+        neg_depth = thickness - kerf_half
+        pos_start_keepout, pos_end_keepout = _corner_endpoint_keepouts(
+            pos_proj, pos_edge_idx, max(pos_depth, 0.0)
+        )
+        neg_start_keepout, neg_end_keepout = _corner_endpoint_keepouts(
+            neg_proj, neg_edge_idx, max(neg_depth, 0.0)
+        )
 
         pos_plateaus = _find_plateau_segments(
             pos_p1, pos_p2, raw_shapes[pos_id], plateau_inset=plateau_inset
@@ -1035,29 +1204,47 @@ def apply_finger_joints_fusion(
         neg_plateaus = _find_plateau_segments(
             neg_p1, neg_p2, raw_shapes[neg_id], plateau_inset=plateau_inset
         )
+        reversed_edge = _edges_reversed(pos_proj, pos_edge_idx, neg_proj, neg_edge_idx)
 
         if pos_plateaus and neg_plateaus:
-            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx, neg_proj, neg_edge_idx)
             neg_in_pos = _reverse_segments(neg_plateaus) if reversed_edge else neg_plateaus
             shared_pos = _intersect_segment_lists(pos_plateaus, neg_in_pos)
             shared_neg = _reverse_segments(shared_pos) if reversed_edge else shared_pos
         elif pos_plateaus:
-            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx, neg_proj, neg_edge_idx)
             shared_pos = pos_plateaus
             shared_neg = _reverse_segments(pos_plateaus) if reversed_edge else pos_plateaus
         elif neg_plateaus:
-            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx, neg_proj, neg_edge_idx)
             shared_neg = neg_plateaus
             shared_pos = _reverse_segments(neg_plateaus) if reversed_edge else neg_plateaus
         else:
             shared_pos = []
             shared_neg = []
 
+        # Keep mating faces in lock-step: shared margins are computed in the
+        # positive face's parametric direction and mapped to the negative side.
+        if reversed_edge:
+            neg_start_in_pos = neg_end_keepout
+            neg_end_in_pos = neg_start_keepout
+        else:
+            neg_start_in_pos = neg_start_keepout
+            neg_end_in_pos = neg_end_keepout
+        shared_start_margin = max(edge_margin, pos_start_keepout, neg_start_in_pos)
+        shared_end_margin = max(edge_margin, pos_end_keepout, neg_end_in_pos)
+
+        if reversed_edge:
+            neg_start_margin = shared_end_margin
+            neg_end_margin = shared_start_margin
+        else:
+            neg_start_margin = shared_start_margin
+            neg_end_margin = shared_end_margin
+
         pos_intervals = _build_fusion_intervals_for_segments(
             pos_len,
             fusion_params,
             segments_t=shared_pos,
             margin=edge_margin,
+            start_margin=shared_start_margin,
+            end_margin=shared_end_margin,
             min_segment_length=min_plateau_length,
         )
         neg_intervals = _build_fusion_intervals_for_segments(
@@ -1065,6 +1252,8 @@ def apply_finger_joints_fusion(
             fusion_params,
             segments_t=shared_neg,
             margin=edge_margin,
+            start_margin=neg_start_margin,
+            end_margin=neg_end_margin,
             min_segment_length=min_plateau_length,
         )
         if pos_intervals is None or neg_intervals is None:
@@ -1073,7 +1262,6 @@ def apply_finger_joints_fusion(
         _, neg_slot_intervals = neg_intervals
 
         # Tabs on positive face
-        pos_depth = thickness + kerf_half
         outward_pos = _outward_direction(pos_p1, pos_p2, shapes[pos_id])
         pos_teeth = _make_comb_from_intervals(
             pos_p1, pos_p2, pos_depth, outward_pos, pos_finger_intervals,
@@ -1083,7 +1271,6 @@ def apply_finger_joints_fusion(
             shapes[pos_id] = shapes[pos_id].union(unary_union(pos_teeth))
 
         # Mating slots on negative face
-        neg_depth = thickness - kerf_half
         if neg_depth > 1e-9:
             outward_neg = _outward_direction(neg_p1, neg_p2, shapes[neg_id])
             inward_neg = (-outward_neg[0], -outward_neg[1])
@@ -1135,6 +1322,8 @@ def apply_finger_joints_fusion(
 
                 slot_len = _dist_2d(slot_start, slot_end)
                 wall_len = _dist_2d(wall_start, wall_end)
+                slot_depth = thickness + kerf_half
+                tab_depth = thickness - kerf_half
 
                 wall_plateaus = _find_plateau_segments(
                     wall_start, wall_end, raw_shapes[fid], plateau_inset=plateau_inset
@@ -1157,11 +1346,28 @@ def apply_finger_joints_fusion(
                 else:
                     shared_plateaus = []
 
+                wall_edge_idx = _find_edge_index_by_endpoints(wall_proj, wall_start, wall_end)
+                if wall_edge_idx is not None:
+                    wall_start_keepout, wall_end_keepout = _corner_endpoint_keepouts(
+                        wall_proj, wall_edge_idx, max(tab_depth, 0.0)
+                    )
+                else:
+                    wall_start_keepout, wall_end_keepout = _corner_keepouts_near_points(
+                        wall_proj, wall_start, wall_end, max(tab_depth, 0.0)
+                    )
+                bottom_start_keepout, bottom_end_keepout = _corner_keepouts_near_points(
+                    bottom_proj, slot_start, slot_end, max(slot_depth, 0.0)
+                )
+                shared_start_margin = max(edge_margin, wall_start_keepout, bottom_start_keepout)
+                shared_end_margin = max(edge_margin, wall_end_keepout, bottom_end_keepout)
+
                 bottom_intervals = _build_fusion_intervals_for_segments(
                     slot_len,
                     fusion_params,
                     segments_t=shared_plateaus,
                     margin=edge_margin,
+                    start_margin=shared_start_margin,
+                    end_margin=shared_end_margin,
                     min_segment_length=min_plateau_length,
                 )
                 wall_intervals = _build_fusion_intervals_for_segments(
@@ -1169,6 +1375,8 @@ def apply_finger_joints_fusion(
                     fusion_params,
                     segments_t=shared_plateaus,
                     margin=edge_margin,
+                    start_margin=shared_start_margin,
+                    end_margin=shared_end_margin,
                     min_segment_length=min_plateau_length,
                 )
                 if bottom_intervals is None or wall_intervals is None:
@@ -1177,7 +1385,6 @@ def apply_finger_joints_fusion(
                 finger_intervals, _ = wall_intervals
 
                 # Slots on bottom plate
-                slot_depth = thickness + kerf_half
                 outward_bottom = _outward_direction(slot_start, slot_end, shapes[bottom_id])
                 inward_bottom = (-outward_bottom[0], -outward_bottom[1])
                 bottom_slots = _make_comb_from_intervals(
@@ -1188,7 +1395,6 @@ def apply_finger_joints_fusion(
                     shapes[bottom_id] = shapes[bottom_id].difference(unary_union(bottom_slots))
 
                 # Tabs on wall
-                tab_depth = thickness - kerf_half
                 if tab_depth <= 1e-9:
                     continue
                 outward_wall = _outward_direction(wall_start, wall_end, shapes[fid])
