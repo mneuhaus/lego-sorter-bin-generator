@@ -26,6 +26,31 @@ DEFAULT_PLATEAU_INSET = 3.0
 # Minimum usable plateau segment length in mm.
 DEFAULT_MIN_PLATEAU_LENGTH = 12.0
 
+# Fusion-style overlap slicing defaults
+FUSION_DYNAMIC_EQUAL = "equal"
+FUSION_DYNAMIC_FIXED_NOTCH = "fixed_notch"
+FUSION_DYNAMIC_FIXED_FINGER = "fixed_finger"
+FUSION_DEFAULT_EDGE_MARGIN = 2.0
+
+FUSION_PLACEMENT_FINGERS_OUTSIDE = "fingers_outside"
+FUSION_PLACEMENT_NOTCHES_OUTSIDE = "notches_outside"
+FUSION_PLACEMENT_SAME_START_FINGER = "same_start_finger"
+FUSION_PLACEMENT_SAME_START_NOTCH = "same_start_notch"
+
+
+@dataclass
+class FusionJointParams:
+    """Sizing/placement settings for the Fusion-style overlap slicing model."""
+    placement_type: str = FUSION_PLACEMENT_FINGERS_OUTSIDE
+    dynamic_size_type: str = FUSION_DYNAMIC_EQUAL
+    is_number_of_fingers_fixed: bool = False
+    fixed_num_fingers: int = 3
+    fixed_finger_size: float = 20.0
+    fixed_notch_size: float = 20.0
+    min_finger_size: float = 20.0
+    min_notch_size: float = 20.0
+    gap: float = 0.0
+
 
 def _dist_2d(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2)
@@ -679,6 +704,506 @@ def apply_finger_joints(
 
         # Separate inner polygons: original face holes vs new slot cutouts
         # The original inner polygons from the projection are already in the Shapely result
+        slot_cutouts[fid] = inners
+
+    return modified, slot_cutouts
+
+
+def _define_fusion_intervals(
+    size: float,
+    params: FusionJointParams,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]] | None:
+    """Port of Fusion add-in interval math.
+
+    Returns:
+      (finger_intervals, slot_intervals)
+      finger_intervals: where tabs are present
+      slot_intervals: where mating slots are cut (includes gap on both sides)
+    """
+    placement_type = params.placement_type
+    dynamic_size_type = params.dynamic_size_type
+    min_finger_size = params.min_finger_size
+    min_notch_size = params.min_notch_size
+    fixed_notch_size = params.fixed_notch_size
+    fixed_finger_size = params.fixed_finger_size
+    is_number_of_fingers_fixed = params.is_number_of_fingers_fixed
+    fixed_num_fingers = params.fixed_num_fingers
+    gap_size = params.gap
+
+    if size <= 0:
+        return None
+
+    if is_number_of_fingers_fixed:
+        num_fingers = max(1, int(fixed_num_fingers))
+        if placement_type == FUSION_PLACEMENT_FINGERS_OUTSIDE:
+            num_notches = num_fingers - 1
+        elif placement_type == FUSION_PLACEMENT_NOTCHES_OUTSIDE:
+            num_notches = num_fingers + 1
+        else:
+            num_notches = num_fingers
+
+        num_gaps = num_fingers + num_notches - 1
+        total_gap_size = num_gaps * gap_size
+
+        if dynamic_size_type == FUSION_DYNAMIC_EQUAL:
+            denom = num_fingers + num_notches
+            if denom <= 0:
+                return None
+            finger_size = (size - total_gap_size) / denom
+            notch_size = finger_size
+        elif dynamic_size_type == FUSION_DYNAMIC_FIXED_NOTCH:
+            notch_size = fixed_notch_size
+            if num_fingers <= 0:
+                return None
+            finger_size = (size - total_gap_size - num_notches * notch_size) / num_fingers
+        elif dynamic_size_type == FUSION_DYNAMIC_FIXED_FINGER:
+            finger_size = fixed_finger_size
+            if num_notches <= 0:
+                return None
+            notch_size = (size - total_gap_size - num_fingers * finger_size) / num_notches
+        else:
+            return None
+    else:
+        if dynamic_size_type == FUSION_DYNAMIC_EQUAL:
+            denom = min_finger_size + gap_size
+            if denom <= 0:
+                return None
+            max_num = int((size + gap_size) / denom)
+            num_fingers = num_notches = int(max_num / 2)
+            if placement_type == FUSION_PLACEMENT_FINGERS_OUTSIDE:
+                if max_num % 2 == 1:
+                    num_fingers += 1
+                else:
+                    num_notches -= 1
+            elif placement_type == FUSION_PLACEMENT_NOTCHES_OUTSIDE:
+                if max_num % 2 == 1:
+                    num_notches += 1
+                else:
+                    num_fingers -= 1
+
+            if num_fingers + num_notches == 0:
+                return None
+            num_gaps = num_fingers + num_notches - 1
+            total_gap_size = num_gaps * gap_size
+            finger_size = (size - total_gap_size) / (num_fingers + num_notches)
+            notch_size = finger_size
+        elif dynamic_size_type == FUSION_DYNAMIC_FIXED_NOTCH:
+            notch_size = fixed_notch_size
+            extra_notch = 0
+            if placement_type == FUSION_PLACEMENT_FINGERS_OUTSIDE:
+                extra_notch = -1
+            elif placement_type == FUSION_PLACEMENT_NOTCHES_OUTSIDE:
+                extra_notch = 1
+            denom = notch_size + min_finger_size + 2 * gap_size
+            if denom <= 0:
+                return None
+            num_fingers = int((size - extra_notch * (notch_size + gap_size) + gap_size) / denom)
+            num_notches = num_fingers + extra_notch
+            if num_fingers == 0:
+                return None
+            num_gaps = num_fingers + num_notches - 1
+            total_gap_size = num_gaps * gap_size
+            finger_size = (size - total_gap_size - num_notches * notch_size) / num_fingers
+        elif dynamic_size_type == FUSION_DYNAMIC_FIXED_FINGER:
+            finger_size = fixed_finger_size
+            extra_finger = 0
+            if placement_type == FUSION_PLACEMENT_FINGERS_OUTSIDE:
+                extra_finger = 1
+            elif placement_type == FUSION_PLACEMENT_NOTCHES_OUTSIDE:
+                extra_finger = -1
+            denom = finger_size + min_notch_size + 2 * gap_size
+            if denom <= 0:
+                return None
+            num_notches = int((size - extra_finger * (finger_size + gap_size) + gap_size) / denom)
+            num_fingers = num_notches + extra_finger
+            if num_notches == 0:
+                return None
+            num_gaps = num_fingers + num_notches - 1
+            total_gap_size = num_gaps * gap_size
+            notch_size = (size - total_gap_size - num_fingers * finger_size) / num_notches
+        else:
+            return None
+
+    epsilon = 1e-5
+    if (
+        num_fingers < 0
+        or num_notches < 0
+        or finger_size <= epsilon
+        or notch_size <= epsilon
+    ):
+        return None
+
+    consumed = (
+        finger_size * num_fingers
+        + notch_size * num_notches
+        + (num_fingers + num_notches - 1) * gap_size
+    )
+    if consumed - epsilon > size:
+        return None
+
+    if placement_type in [FUSION_PLACEMENT_FINGERS_OUTSIDE, FUSION_PLACEMENT_SAME_START_FINGER]:
+        finger_start = 0.0
+        notch_start = finger_size + gap_size
+    else:
+        finger_start = notch_size + gap_size
+        notch_start = 0.0
+
+    spacing = finger_size + notch_size + 2 * gap_size
+    finger_intervals = [
+        (finger_start + i * spacing, finger_size)
+        for i in range(num_fingers)
+    ]
+    # Fusion behavior: tool body includes the full gap on both sides.
+    slot_intervals = [
+        (finger_start + i * spacing - gap_size, finger_size + 2 * gap_size)
+        for i in range(num_fingers)
+    ]
+    # Keep notch_start alive for parity with the source formulas and easier debugging.
+    _ = notch_start
+    return finger_intervals, slot_intervals
+
+
+def _build_fusion_intervals_for_segments(
+    edge_len: float,
+    params: FusionJointParams,
+    segments_t: list[tuple[float, float]] | None = None,
+    margin: float = 0.0,
+    min_segment_length: float = 0.0,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]] | None:
+    """Build Fusion-style intervals on one or more parametric edge segments."""
+    if edge_len <= 1e-9:
+        return None
+
+    margin_t = max(0.0, margin / edge_len) if margin > 0 else 0.0
+    margin_t = min(margin_t, 0.49)
+
+    if segments_t:
+        segments: list[tuple[float, float]] = []
+        for s, e in segments_t:
+            s2 = max(s, margin_t)
+            e2 = min(e, 1.0 - margin_t)
+            seg_len = (e2 - s2) * edge_len
+            if seg_len >= max(1e-6, min_segment_length):
+                segments.append((s2, e2))
+    else:
+        if 1.0 - margin_t <= margin_t + 1e-6:
+            return None
+        segments = [(margin_t, 1.0 - margin_t)]
+
+    finger_intervals: list[tuple[float, float]] = []
+    slot_intervals: list[tuple[float, float]] = []
+    for s, e in segments:
+        seg_len = (e - s) * edge_len
+        seg_intervals = _define_fusion_intervals(seg_len, params)
+        if seg_intervals is None:
+            continue
+        seg_fingers, seg_slots = seg_intervals
+        offset = s * edge_len
+        finger_intervals.extend([(offset + a, w) for a, w in seg_fingers])
+        slot_intervals.extend([(offset + a, w) for a, w in seg_slots])
+
+    if not finger_intervals and not slot_intervals:
+        return None
+    return sorted(finger_intervals), sorted(slot_intervals)
+
+
+def _make_comb_from_intervals(
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    depth: float,
+    outward_dir: tuple[float, float],
+    intervals: list[tuple[float, float]],
+    start_offset: float = 0.0,
+    overlap: float = 0.01,
+    exclusion_zones: list[Polygon] | None = None,
+) -> list[Polygon]:
+    """Create rectangular teeth from absolute intervals along an edge."""
+    teeth: list[Polygon] = []
+    edge_len = _dist_2d(p1, p2)
+    if edge_len < 1e-6 or depth <= 1e-9:
+        return teeth
+
+    ux = (p2[0] - p1[0]) / edge_len
+    uy = (p2[1] - p1[1]) / edge_len
+    nx, ny = outward_dir
+
+    for start, width in intervals:
+        if width <= 1e-9:
+            continue
+        a = start_offset + start
+        b = a + width
+        if b <= a + 1e-9:
+            continue
+
+        s0 = (p1[0] + ux * a, p1[1] + uy * a)
+        s1 = (p1[0] + ux * b, p1[1] + uy * b)
+
+        rect = Polygon([
+            (s0[0] - nx * overlap, s0[1] - ny * overlap),
+            (s1[0] - nx * overlap, s1[1] - ny * overlap),
+            (s1[0] + nx * depth, s1[1] + ny * depth),
+            (s0[0] + nx * depth, s0[1] + ny * depth),
+        ])
+        if not rect.is_valid or rect.area <= 0:
+            continue
+        if exclusion_zones and any(rect.intersects(z) for z in exclusion_zones):
+            continue
+        teeth.append(rect)
+
+    return teeth
+
+
+def apply_finger_joints_fusion(
+    projections: dict[int, Projection2D],
+    shared_edges: list[SharedEdge],
+    bottom_id: int,
+    thickness: float,
+    kerf: float = 0.0,
+    edge_margin: float = -1,
+    notch_buffer: float = -1,
+    plateau_inset: float = -1,
+    min_plateau_length: float = -1,
+    faces: list[PlanarFace] | None = None,
+    fusion_params: FusionJointParams | None = None,
+) -> tuple[dict[int, list[tuple[float, float]]], dict[int, list[list[tuple[float, float]]]]]:
+    """Apply joints using a Fusion-style overlap slicing interval model."""
+    if fusion_params is None:
+        fusion_params = FusionJointParams()
+
+    # Fusion add-in has no explicit edge margin concept; default to 0 unless set.
+    if edge_margin < 0:
+        edge_margin = FUSION_DEFAULT_EDGE_MARGIN
+    if notch_buffer < 0:
+        notch_buffer = DEFAULT_NOTCH_BUFFER
+    if plateau_inset < 0:
+        plateau_inset = DEFAULT_PLATEAU_INSET
+    if min_plateau_length < 0:
+        min_plateau_length = DEFAULT_MIN_PLATEAU_LENGTH
+
+    kerf_half = kerf / 2.0
+
+    raw_shapes: dict[int, Polygon] = {}
+    shapes: dict[int, Polygon] = {}
+    for fid, proj in projections.items():
+        shape = _polygon_to_shapely(proj.outer_polygon, proj.inner_polygons)
+        raw_shapes[fid] = shape
+        close_dist = thickness * 1.5
+        if fid == bottom_id:
+            cleaned = shape.buffer(close_dist, join_style='mitre').buffer(-close_dist, join_style='mitre')
+        else:
+            cleaned = shape.buffer(-close_dist, join_style='mitre').buffer(close_dist, join_style='mitre')
+        if not cleaned.is_empty and cleaned.is_valid:
+            if isinstance(cleaned, MultiPolygon):
+                cleaned = max(cleaned.geoms, key=lambda g: g.area)
+            shape = cleaned
+        shapes[fid] = shape
+
+    exclusion_zones: dict[int, list[Polygon]] = {}
+    for fid, proj in projections.items():
+        exclusion_zones[fid] = _build_exclusion_zones(proj, notch_buffer)
+
+    # Direct shared-edge joints
+    for se in shared_edges:
+        fid_a = se.face_a_id
+        fid_b = se.face_b_id
+        if fid_a not in projections or fid_b not in projections:
+            continue
+
+        if fid_a == bottom_id:
+            pos_id, neg_id = fid_a, fid_b
+        elif fid_b == bottom_id:
+            pos_id, neg_id = fid_b, fid_a
+        else:
+            pos_id = min(fid_a, fid_b)
+            neg_id = max(fid_a, fid_b)
+
+        pos_proj = projections[pos_id]
+        neg_proj = projections[neg_id]
+        pos_edge_idx = _find_matching_edge_index(pos_proj, se)
+        neg_edge_idx = _find_matching_edge_index(neg_proj, se)
+        if pos_edge_idx is None or neg_edge_idx is None:
+            continue
+
+        pos_p1, pos_p2 = pos_proj.outer_edges_2d[pos_edge_idx]
+        neg_p1, neg_p2 = neg_proj.outer_edges_2d[neg_edge_idx]
+        pos_len = _dist_2d(pos_p1, pos_p2)
+        neg_len = _dist_2d(neg_p1, neg_p2)
+
+        pos_plateaus = _find_plateau_segments(
+            pos_p1, pos_p2, raw_shapes[pos_id], plateau_inset=plateau_inset
+        )
+        neg_plateaus = _find_plateau_segments(
+            neg_p1, neg_p2, raw_shapes[neg_id], plateau_inset=plateau_inset
+        )
+
+        if pos_plateaus and neg_plateaus:
+            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx, neg_proj, neg_edge_idx)
+            neg_in_pos = _reverse_segments(neg_plateaus) if reversed_edge else neg_plateaus
+            shared_pos = _intersect_segment_lists(pos_plateaus, neg_in_pos)
+            shared_neg = _reverse_segments(shared_pos) if reversed_edge else shared_pos
+        elif pos_plateaus:
+            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx, neg_proj, neg_edge_idx)
+            shared_pos = pos_plateaus
+            shared_neg = _reverse_segments(pos_plateaus) if reversed_edge else pos_plateaus
+        elif neg_plateaus:
+            reversed_edge = _edges_reversed(pos_proj, pos_edge_idx, neg_proj, neg_edge_idx)
+            shared_neg = neg_plateaus
+            shared_pos = _reverse_segments(neg_plateaus) if reversed_edge else neg_plateaus
+        else:
+            shared_pos = []
+            shared_neg = []
+
+        pos_intervals = _build_fusion_intervals_for_segments(
+            pos_len,
+            fusion_params,
+            segments_t=shared_pos,
+            margin=edge_margin,
+            min_segment_length=min_plateau_length,
+        )
+        neg_intervals = _build_fusion_intervals_for_segments(
+            neg_len,
+            fusion_params,
+            segments_t=shared_neg,
+            margin=edge_margin,
+            min_segment_length=min_plateau_length,
+        )
+        if pos_intervals is None or neg_intervals is None:
+            continue
+        pos_finger_intervals, _ = pos_intervals
+        _, neg_slot_intervals = neg_intervals
+
+        # Tabs on positive face
+        pos_depth = thickness + kerf_half
+        outward_pos = _outward_direction(pos_p1, pos_p2, shapes[pos_id])
+        pos_teeth = _make_comb_from_intervals(
+            pos_p1, pos_p2, pos_depth, outward_pos, pos_finger_intervals,
+            exclusion_zones=exclusion_zones.get(pos_id, []),
+        )
+        if pos_teeth:
+            shapes[pos_id] = shapes[pos_id].union(unary_union(pos_teeth))
+
+        # Mating slots on negative face
+        neg_depth = thickness - kerf_half
+        if neg_depth > 1e-9:
+            outward_neg = _outward_direction(neg_p1, neg_p2, shapes[neg_id])
+            inward_neg = (-outward_neg[0], -outward_neg[1])
+            neg_teeth = _make_comb_from_intervals(
+                neg_p1, neg_p2, neg_depth, inward_neg, neg_slot_intervals,
+                exclusion_zones=exclusion_zones.get(neg_id, []),
+            )
+            if neg_teeth:
+                shapes[neg_id] = shapes[neg_id].difference(unary_union(neg_teeth))
+
+    # Through-slot joints for walls not directly adjacent to bottom
+    if faces is not None:
+        face_map = {f.face_id: f for f in faces}
+        bottom_face = face_map.get(bottom_id)
+        if bottom_face is not None:
+            bottom_adjacent = set()
+            for se in shared_edges:
+                if se.face_a_id == bottom_id:
+                    bottom_adjacent.add(se.face_b_id)
+                elif se.face_b_id == bottom_id:
+                    bottom_adjacent.add(se.face_a_id)
+
+            for fid, proj in projections.items():
+                if fid == bottom_id or fid in bottom_adjacent:
+                    continue
+
+                wall_face = face_map.get(fid)
+                if wall_face is None:
+                    continue
+                endpoints = _find_bottom_edge_endpoints(wall_face, bottom_face)
+                if endpoints is None:
+                    continue
+                p_start_3d, p_end_3d = endpoints
+
+                bottom_proj = projections[bottom_id]
+                slot_start = _project_point(
+                    p_start_3d, bottom_proj.origin_3d, bottom_proj.u_axis, bottom_proj.v_axis
+                )
+                slot_end = _project_point(
+                    p_end_3d, bottom_proj.origin_3d, bottom_proj.u_axis, bottom_proj.v_axis
+                )
+                wall_proj = projections[fid]
+                wall_start = _project_point(
+                    p_start_3d, wall_proj.origin_3d, wall_proj.u_axis, wall_proj.v_axis
+                )
+                wall_end = _project_point(
+                    p_end_3d, wall_proj.origin_3d, wall_proj.u_axis, wall_proj.v_axis
+                )
+
+                slot_len = _dist_2d(slot_start, slot_end)
+                wall_len = _dist_2d(wall_start, wall_end)
+
+                wall_plateaus = _find_plateau_segments(
+                    wall_start, wall_end, raw_shapes[fid], plateau_inset=plateau_inset
+                )
+                bottom_plateaus = _find_plateau_segments(
+                    slot_start, slot_end, raw_shapes[bottom_id], plateau_inset=plateau_inset
+                )
+
+                if wall_plateaus and bottom_plateaus:
+                    intersection = _intersect_segment_lists(wall_plateaus, bottom_plateaus)
+                    intersection = [
+                        (s, e) for s, e in intersection
+                        if (e - s) * wall_len >= min_plateau_length - 1e-6
+                    ]
+                    shared_plateaus = intersection if intersection else wall_plateaus
+                elif wall_plateaus:
+                    shared_plateaus = wall_plateaus
+                elif bottom_plateaus:
+                    shared_plateaus = bottom_plateaus
+                else:
+                    shared_plateaus = []
+
+                bottom_intervals = _build_fusion_intervals_for_segments(
+                    slot_len,
+                    fusion_params,
+                    segments_t=shared_plateaus,
+                    margin=edge_margin,
+                    min_segment_length=min_plateau_length,
+                )
+                wall_intervals = _build_fusion_intervals_for_segments(
+                    wall_len,
+                    fusion_params,
+                    segments_t=shared_plateaus,
+                    margin=edge_margin,
+                    min_segment_length=min_plateau_length,
+                )
+                if bottom_intervals is None or wall_intervals is None:
+                    continue
+                _, slot_intervals = bottom_intervals
+                finger_intervals, _ = wall_intervals
+
+                # Slots on bottom plate
+                slot_depth = thickness + kerf_half
+                outward_bottom = _outward_direction(slot_start, slot_end, shapes[bottom_id])
+                inward_bottom = (-outward_bottom[0], -outward_bottom[1])
+                bottom_slots = _make_comb_from_intervals(
+                    slot_start, slot_end, slot_depth, inward_bottom, slot_intervals,
+                    exclusion_zones=exclusion_zones.get(bottom_id, []),
+                )
+                if bottom_slots:
+                    shapes[bottom_id] = shapes[bottom_id].difference(unary_union(bottom_slots))
+
+                # Tabs on wall
+                tab_depth = thickness - kerf_half
+                if tab_depth <= 1e-9:
+                    continue
+                outward_wall = _outward_direction(wall_start, wall_end, shapes[fid])
+                wall_tabs = _make_comb_from_intervals(
+                    wall_start, wall_end, tab_depth, outward_wall, finger_intervals,
+                    exclusion_zones=exclusion_zones.get(fid, []),
+                )
+                if wall_tabs:
+                    shapes[fid] = shapes[fid].union(unary_union(wall_tabs))
+
+    modified: dict[int, list[tuple[float, float]]] = {}
+    slot_cutouts: dict[int, list[list[tuple[float, float]]]] = {}
+    for fid, shape in shapes.items():
+        outer, inners = _shapely_to_vertices(shape)
+        modified[fid] = outer
         slot_cutouts[fid] = inners
 
     return modified, slot_cutouts
