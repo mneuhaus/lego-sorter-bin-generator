@@ -75,6 +75,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--svg-verify-overlap-mesh-offset",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional normal offset (mm) applied to the second face in overlap panels "
+            "for fold-depth visualization (default: 0.0)"
+        ),
+    )
+    parser.add_argument(
         "--svg-verify-overlap-baseline",
         default=None,
         help="Path to baseline overlap SVG used for regression diff/updates",
@@ -263,6 +272,8 @@ def main():
         print("  SVG original overlay: enabled")
     if args.svg_verify_overlap:
         print("  SVG overlap verifier: enabled")
+        if abs(args.svg_verify_overlap_mesh_offset) > 1e-9:
+            print(f"  SVG overlap mesh offset: {args.svg_verify_overlap_mesh_offset} mm")
     print(f"  Placement: {args.fusion_placement}")
     print(f"  Size mode: {args.fusion_size_mode}")
     print(f"  Count mode: {args.fusion_count_mode}")
@@ -354,7 +365,7 @@ def main():
                 shared_edges=relevant_shared,
                 bottom_id=bottom.face_id,
                 faces=faces,
-                mesh_offset=args.thickness if args.tab_direction == TAB_DIRECTION_INWARD else 0.0,
+                mesh_offset=args.svg_verify_overlap_mesh_offset,
             )
             written.append(verify_file)
             print(f"  Written: {verify_file}")

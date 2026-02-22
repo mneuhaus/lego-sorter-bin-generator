@@ -5,6 +5,9 @@ Generate laser-cut DXF/SVG files (including overlap verification views) from STE
 ## Overlap Baseline + Heatmap Diff
 
 Use this to catch visual regressions between runs.
+By default overlap panels use `--svg-verify-overlap-mesh-offset 0.0` (edge-aligned).
+Use `--svg-verify-overlap-mesh-offset <mm>` only when you explicitly want a
+fold-depth shifted preview.
 
 1. Create/update baseline from current overlap verifier output:
 
@@ -28,6 +31,16 @@ uv run python -m lasercut.cli step_files/bin_third_center.step \
   --svg-verify-overlap \
   --svg-verify-overlap-baseline output/baselines/bin_third_center-overlap.svg \
   --svg-verify-overlap-diff
+```
+
+Optional shifted preview example:
+
+```bash
+uv run python -m lasercut.cli step_files/bin_third_center.step \
+  --format svg \
+  --output output \
+  --svg-verify-overlap \
+  --svg-verify-overlap-mesh-offset 3.2
 ```
 
 Generated files:
