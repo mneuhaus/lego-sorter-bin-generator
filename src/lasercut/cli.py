@@ -16,6 +16,8 @@ from .finger_joints import (
     FUSION_PLACEMENT_NOTCHES_OUTSIDE,
     FUSION_PLACEMENT_SAME_START_FINGER,
     FUSION_PLACEMENT_SAME_START_NOTCH,
+    TAB_DIRECTION_INWARD,
+    TAB_DIRECTION_OUTWARD,
 )
 from .exporter import DEFAULT_FOLDED_OFFSET, DEFAULT_LAYOUT
 
@@ -50,8 +52,19 @@ def main():
                         help=f"Minimum plateau segment length in mm, -1 = auto ({DEFAULT_MIN_PLATEAU_LENGTH}mm)")
     parser.add_argument("--layout", choices=["folded", "packed"], default=DEFAULT_LAYOUT,
                         help=f"Part layout mode (default: {DEFAULT_LAYOUT})")
+    parser.add_argument(
+        "--tab-direction",
+        choices=[TAB_DIRECTION_OUTWARD, TAB_DIRECTION_INWARD],
+        default=TAB_DIRECTION_OUTWARD,
+        help=f"Positive tab style: {TAB_DIRECTION_OUTWARD} (legacy) or {TAB_DIRECTION_INWARD}",
+    )
     parser.add_argument("--wall-offset", type=float, default=DEFAULT_FOLDED_OFFSET,
                         help=f"Gap from bottom plate to surrounding walls in folded layout (default: {DEFAULT_FOLDED_OFFSET}mm)")
+    parser.add_argument(
+        "--svg-overlay-original",
+        action="store_true",
+        help="Draw original projected face geometry in green on SVG for dimension debugging",
+    )
     parser.add_argument(
         "--fusion-placement",
         choices=[
@@ -196,6 +209,9 @@ def main():
     print(f"  Plateau inset: {pi_display} mm")
     print(f"  Min plateau length: {mpl_display} mm")
     print(f"  Layout: {args.layout}")
+    print(f"  Tab direction: {args.tab_direction}")
+    if args.svg_overlay_original:
+        print("  SVG original overlay: enabled")
     print(f"  Placement: {args.fusion_placement}")
     print(f"  Size mode: {args.fusion_size_mode}")
     print(f"  Count mode: {args.fusion_count_mode}")
@@ -228,6 +244,7 @@ def main():
         notch_buffer=args.notch_buffer,
         plateau_inset=args.plateau_inset,
         min_plateau_length=args.min_plateau_length,
+        tab_direction=args.tab_direction,
         faces=faces,
         fusion_params=fusion_params,
     )
@@ -271,7 +288,8 @@ def main():
                               layout=args.layout, wall_offset=args.wall_offset,
                               shared_edges=relevant_shared,
                               bottom_id=bottom.face_id,
-                              faces=faces)
+                              faces=faces,
+                              overlay_original=args.svg_overlay_original)
         written.append(svg_file)
         print(f"  Written: {svg_file}")
 

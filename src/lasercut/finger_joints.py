@@ -7,7 +7,7 @@ This correctly handles corners, edge transitions, and complex polygon shapes.
 
 import math
 from dataclasses import dataclass
-from shapely.geometry import Point, Polygon, MultiPolygon
+from shapely.geometry import Point, Polygon, MultiPolygon, GeometryCollection
 from shapely.ops import unary_union
 
 from .projector import Projection2D, _project_point, _normalize, _cross, _sub, _dot
@@ -31,6 +31,9 @@ FUSION_PLACEMENT_FINGERS_OUTSIDE = "fingers_outside"
 FUSION_PLACEMENT_NOTCHES_OUTSIDE = "notches_outside"
 FUSION_PLACEMENT_SAME_START_FINGER = "same_start_finger"
 FUSION_PLACEMENT_SAME_START_NOTCH = "same_start_notch"
+
+TAB_DIRECTION_OUTWARD = "outward"
+TAB_DIRECTION_INWARD = "inward"
 
 
 @dataclass
@@ -327,6 +330,11 @@ def _shapely_to_vertices(geom) -> tuple[list[tuple[float, float]], list[list[tup
     if isinstance(geom, MultiPolygon):
         # Take the largest polygon
         geom = max(geom.geoms, key=lambda g: g.area)
+    elif isinstance(geom, GeometryCollection):
+        polys = [g for g in geom.geoms if isinstance(g, Polygon) and not g.is_empty]
+        if not polys:
+            return [], []
+        geom = max(polys, key=lambda g: g.area)
 
     outer = list(geom.exterior.coords[:-1])  # Shapely repeats the first point
     inners = [list(ring.coords[:-1]) for ring in geom.interiors]
@@ -607,6 +615,43 @@ def _build_fusion_intervals_for_segments(
     min_segment_length: float = 0.0,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]] | None:
     """Build Fusion-style intervals on one or more parametric edge segments."""
+    segments = _resolve_joint_segments(
+        edge_len=edge_len,
+        segments_t=segments_t,
+        margin=margin,
+        start_margin=start_margin,
+        end_margin=end_margin,
+        min_segment_length=min_segment_length,
+    )
+    if segments is None:
+        return None
+
+    finger_intervals: list[tuple[float, float]] = []
+    slot_intervals: list[tuple[float, float]] = []
+    for s, e in segments:
+        seg_len = (e - s) * edge_len
+        seg_intervals = _define_fusion_intervals(seg_len, params)
+        if seg_intervals is None:
+            continue
+        seg_fingers, seg_slots = seg_intervals
+        offset = s * edge_len
+        finger_intervals.extend([(offset + a, w) for a, w in seg_fingers])
+        slot_intervals.extend([(offset + a, w) for a, w in seg_slots])
+
+    if not finger_intervals and not slot_intervals:
+        return None
+    return sorted(finger_intervals), sorted(slot_intervals)
+
+
+def _resolve_joint_segments(
+    edge_len: float,
+    segments_t: list[tuple[float, float]] | None = None,
+    margin: float = 0.0,
+    start_margin: float | None = None,
+    end_margin: float | None = None,
+    min_segment_length: float = 0.0,
+) -> list[tuple[float, float]] | None:
+    """Resolve valid parametric edge segments after applying margins."""
     if edge_len <= 1e-9:
         return None
 
@@ -627,24 +672,134 @@ def _build_fusion_intervals_for_segments(
             seg_len = (e2 - s2) * edge_len
             if seg_len >= max(1e-6, min_segment_length):
                 segments.append((s2, e2))
-    else:
-        segments = [(start_t, 1.0 - end_t)]
+        return segments
 
-    finger_intervals: list[tuple[float, float]] = []
-    slot_intervals: list[tuple[float, float]] = []
+    return [(start_t, 1.0 - end_t)]
+
+
+def _placement_edge_notch_policy(placement_type: str) -> tuple[bool, bool]:
+    """Whether the placement mode should include notch regions at segment edges."""
+    if placement_type == FUSION_PLACEMENT_NOTCHES_OUTSIDE:
+        return True, True
+    if placement_type == FUSION_PLACEMENT_SAME_START_FINGER:
+        return False, True
+    if placement_type == FUSION_PLACEMENT_SAME_START_NOTCH:
+        return True, False
+    return False, False
+
+
+def _notch_intervals_from_fingers(
+    finger_intervals: list[tuple[float, float]],
+    seg_len: float,
+    include_start: bool,
+    include_end: bool,
+) -> list[tuple[float, float]]:
+    """Derive notch intervals from finger spans on one local segment."""
+    eps = 1e-6
+    if seg_len <= eps:
+        return []
+
+    clipped: list[tuple[float, float]] = []
+    for start, width in finger_intervals:
+        if width <= eps:
+            continue
+        s = max(0.0, start)
+        e = min(seg_len, start + width)
+        if e > s + eps:
+            clipped.append((s, e))
+    clipped.sort()
+    if not clipped:
+        return [(0.0, seg_len)] if include_start and include_end else []
+
+    notches: list[tuple[float, float]] = []
+
+    first_start, first_end = clipped[0]
+    if include_start and first_start > eps:
+        notches.append((0.0, first_start))
+
+    prev_end = first_end
+    for start, end in clipped[1:]:
+        gap_width = start - prev_end
+        if gap_width > eps:
+            notches.append((prev_end, gap_width))
+        prev_end = max(prev_end, end)
+
+    if include_end and seg_len - prev_end > eps:
+        notches.append((prev_end, seg_len - prev_end))
+
+    return notches
+
+
+def _build_inward_notch_intervals_for_segments(
+    edge_len: float,
+    params: FusionJointParams,
+    segments_t: list[tuple[float, float]] | None = None,
+    margin: float = 0.0,
+    start_margin: float | None = None,
+    end_margin: float | None = None,
+    min_segment_length: float = 0.0,
+    force_terminal_margin_notches: bool = False,
+) -> list[tuple[float, float]]:
+    """Build inward-notch intervals per segment to avoid cross-segment artifacts."""
+    eps = 1e-6
+    segments = _resolve_joint_segments(
+        edge_len=edge_len,
+        segments_t=segments_t,
+        margin=margin,
+        start_margin=start_margin,
+        end_margin=end_margin,
+        min_segment_length=min_segment_length,
+    )
+    if not segments:
+        return []
+
+    include_start, include_end = _placement_edge_notch_policy(params.placement_type)
+    notch_intervals: list[tuple[float, float]] = []
     for s, e in segments:
         seg_len = (e - s) * edge_len
         seg_intervals = _define_fusion_intervals(seg_len, params)
         if seg_intervals is None:
             continue
-        seg_fingers, seg_slots = seg_intervals
+        seg_fingers, _ = seg_intervals
+        seg_notches = _notch_intervals_from_fingers(
+            seg_fingers,
+            seg_len=seg_len,
+            include_start=include_start,
+            include_end=include_end,
+        )
         offset = s * edge_len
-        finger_intervals.extend([(offset + a, w) for a, w in seg_fingers])
-        slot_intervals.extend([(offset + a, w) for a, w in seg_slots])
+        notch_intervals.extend((offset + start, width) for start, width in seg_notches)
 
-    if not finger_intervals and not slot_intervals:
-        return None
-    return sorted(finger_intervals), sorted(slot_intervals)
+    # For placements that start/end with notches (or when explicitly forced),
+    # treat terminal margins outside the active segment range as notches.
+    # This avoids unmatched end-fingers in inward mode.
+    if segments:
+        first_seg_start = segments[0][0] * edge_len
+        last_seg_end = segments[-1][1] * edge_len
+        if (include_start or force_terminal_margin_notches) and first_seg_start > eps:
+            notch_intervals.append((0.0, first_seg_start))
+        end_leftover = edge_len - last_seg_end
+        if (include_end or force_terminal_margin_notches) and end_leftover > eps:
+            notch_intervals.append((last_seg_end, end_leftover))
+
+    if not notch_intervals:
+        return []
+
+    merged: list[tuple[float, float]] = []
+    for start, width in sorted(notch_intervals):
+        if width <= eps:
+            continue
+        end = start + width
+        if not merged:
+            merged.append((start, width))
+            continue
+        prev_start, prev_width = merged[-1]
+        prev_end = prev_start + prev_width
+        if start <= prev_end + eps:
+            merged[-1] = (prev_start, max(prev_end, end) - prev_start)
+        else:
+            merged.append((start, width))
+    return merged
 
 
 def _make_comb_from_intervals(
@@ -693,6 +848,46 @@ def _make_comb_from_intervals(
     return teeth
 
 
+def _complement_notch_intervals(
+    edge_len: float,
+    finger_intervals: list[tuple[float, float]],
+    eps: float = 1e-6,
+) -> list[tuple[float, float]]:
+    """Return notch intervals as the complement of finger intervals on [0, edge_len]."""
+    if edge_len <= eps or not finger_intervals:
+        return []
+
+    spans: list[tuple[float, float]] = []
+    for start, width in finger_intervals:
+        if width <= eps:
+            continue
+        s = max(0.0, start)
+        e = min(edge_len, start + width)
+        if e > s + eps:
+            spans.append((s, e))
+    if not spans:
+        return []
+
+    spans.sort()
+    merged: list[tuple[float, float]] = [spans[0]]
+    for s, e in spans[1:]:
+        ps, pe = merged[-1]
+        if s <= pe + eps:
+            merged[-1] = (ps, max(pe, e))
+        else:
+            merged.append((s, e))
+
+    notches: list[tuple[float, float]] = []
+    cur = 0.0
+    for s, e in merged:
+        if s > cur + eps:
+            notches.append((cur, s - cur))
+        cur = max(cur, e)
+    if edge_len > cur + eps:
+        notches.append((cur, edge_len - cur))
+    return notches
+
+
 def apply_finger_joints_fusion(
     projections: dict[int, Projection2D],
     shared_edges: list[SharedEdge],
@@ -703,6 +898,7 @@ def apply_finger_joints_fusion(
     notch_buffer: float = -1,
     plateau_inset: float = -1,
     min_plateau_length: float = -1,
+    tab_direction: str = TAB_DIRECTION_OUTWARD,
     faces: list[PlanarFace] | None = None,
     fusion_params: FusionJointParams | None = None,
 ) -> tuple[dict[int, list[tuple[float, float]]], dict[int, list[list[tuple[float, float]]]]]:
@@ -720,8 +916,13 @@ def apply_finger_joints_fusion(
     if min_plateau_length < 0:
         min_plateau_length = DEFAULT_MIN_PLATEAU_LENGTH
 
-    kerf_half = kerf / 2.0
+    if tab_direction not in (TAB_DIRECTION_OUTWARD, TAB_DIRECTION_INWARD):
+        raise ValueError(
+            f"Unsupported tab_direction={tab_direction!r}; expected "
+            f"{TAB_DIRECTION_OUTWARD!r} or {TAB_DIRECTION_INWARD!r}"
+        )
 
+    kerf_half = kerf / 2.0
     raw_shapes: dict[int, Polygon] = {}
     shapes: dict[int, Polygon] = {}
     for fid, proj in projections.items():
@@ -840,14 +1041,26 @@ def apply_finger_joints_fusion(
         pos_finger_intervals, _ = pos_intervals
         _, neg_slot_intervals = neg_intervals
 
-        # Tabs on positive face
+        # Positive face geometry: tabs outward (legacy) or notches inward.
         outward_pos = _outward_direction(pos_p1, pos_p2, shapes[pos_id])
-        pos_teeth = _make_comb_from_intervals(
-            pos_p1, pos_p2, pos_depth, outward_pos, pos_finger_intervals,
-            exclusion_zones=exclusion_zones.get(pos_id, []),
-        )
-        if pos_teeth:
-            shapes[pos_id] = shapes[pos_id].union(unary_union(pos_teeth))
+        if tab_direction == TAB_DIRECTION_INWARD:
+            inward_pos = (-outward_pos[0], -outward_pos[1])
+            # In inward mode, notch everywhere fingers are absent so positive
+            # geometry always mates with slot intervals on the opposite face.
+            pos_notch_intervals = _complement_notch_intervals(pos_len, pos_finger_intervals)
+            pos_notches = _make_comb_from_intervals(
+                pos_p1, pos_p2, pos_depth, inward_pos, pos_notch_intervals,
+                exclusion_zones=exclusion_zones.get(pos_id, []),
+            )
+            if pos_notches:
+                shapes[pos_id] = shapes[pos_id].difference(unary_union(pos_notches))
+        else:
+            pos_teeth = _make_comb_from_intervals(
+                pos_p1, pos_p2, pos_depth, outward_pos, pos_finger_intervals,
+                exclusion_zones=exclusion_zones.get(pos_id, []),
+            )
+            if pos_teeth:
+                shapes[pos_id] = shapes[pos_id].union(unary_union(pos_teeth))
 
         # Mating slots on negative face
         if neg_depth > 1e-9:
@@ -973,16 +1186,28 @@ def apply_finger_joints_fusion(
                 if bottom_slots:
                     shapes[bottom_id] = shapes[bottom_id].difference(unary_union(bottom_slots))
 
-                # Tabs on wall
+                # Wall geometry: tabs outward (legacy) or notches inward.
                 if tab_depth <= 1e-9:
                     continue
                 outward_wall = _outward_direction(wall_start, wall_end, shapes[fid])
-                wall_tabs = _make_comb_from_intervals(
-                    wall_start, wall_end, tab_depth, outward_wall, finger_intervals,
-                    exclusion_zones=exclusion_zones.get(fid, []),
-                )
-                if wall_tabs:
-                    shapes[fid] = shapes[fid].union(unary_union(wall_tabs))
+                if tab_direction == TAB_DIRECTION_INWARD:
+                    inward_wall = (-outward_wall[0], -outward_wall[1])
+                    # Keep through-slot wall fingers exactly complementary to
+                    # bottom slot intervals to prevent unmatched end fingers.
+                    wall_notch_intervals = _complement_notch_intervals(wall_len, finger_intervals)
+                    wall_notches = _make_comb_from_intervals(
+                        wall_start, wall_end, tab_depth, inward_wall, wall_notch_intervals,
+                        exclusion_zones=exclusion_zones.get(fid, []),
+                    )
+                    if wall_notches:
+                        shapes[fid] = shapes[fid].difference(unary_union(wall_notches))
+                else:
+                    wall_tabs = _make_comb_from_intervals(
+                        wall_start, wall_end, tab_depth, outward_wall, finger_intervals,
+                        exclusion_zones=exclusion_zones.get(fid, []),
+                    )
+                    if wall_tabs:
+                        shapes[fid] = shapes[fid].union(unary_union(wall_tabs))
 
     modified: dict[int, list[tuple[float, float]]] = {}
     slot_cutouts: dict[int, list[list[tuple[float, float]]]] = {}

@@ -116,6 +116,100 @@ def _prepare_parts(
     return parts
 
 
+def _triangle_area2(a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _invert_3x3(m: list[list[float]]) -> list[list[float]] | None:
+    """Invert a 3x3 matrix, returning None if singular."""
+    a, b, c = m[0]
+    d, e, f = m[1]
+    g, h, i = m[2]
+
+    det = (
+        a * (e * i - f * h)
+        - b * (d * i - f * g)
+        + c * (d * h - e * g)
+    )
+    if abs(det) < 1e-12:
+        return None
+
+    inv_det = 1.0 / det
+    return [
+        [
+            (e * i - f * h) * inv_det,
+            (c * h - b * i) * inv_det,
+            (b * f - c * e) * inv_det,
+        ],
+        [
+            (f * g - d * i) * inv_det,
+            (a * i - c * g) * inv_det,
+            (c * d - a * f) * inv_det,
+        ],
+        [
+            (d * h - e * g) * inv_det,
+            (b * g - a * h) * inv_det,
+            (a * e - b * d) * inv_det,
+        ],
+    ]
+
+
+def _mul_mat3_vec3(m: list[list[float]], v: list[float]) -> list[float]:
+    return [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+
+
+def _solve_affine_from_corresponding_polygons(
+    src_poly: list[tuple[float, float]],
+    dst_poly: list[tuple[float, float]],
+) -> tuple[float, float, float, float, float, float] | None:
+    """Solve affine transform mapping corresponding source polygon points to destination."""
+    n = min(len(src_poly), len(dst_poly))
+    if n < 3:
+        return None
+
+    tri = None
+    for i in range(n - 2):
+        for j in range(i + 1, n - 1):
+            for k in range(j + 1, n):
+                if abs(_triangle_area2(src_poly[i], src_poly[j], src_poly[k])) > 1e-9:
+                    tri = (i, j, k)
+                    break
+            if tri is not None:
+                break
+        if tri is not None:
+            break
+    if tri is None:
+        return None
+
+    i, j, k = tri
+    m = [
+        [src_poly[i][0], src_poly[i][1], 1.0],
+        [src_poly[j][0], src_poly[j][1], 1.0],
+        [src_poly[k][0], src_poly[k][1], 1.0],
+    ]
+    inv = _invert_3x3(m)
+    if inv is None:
+        return None
+
+    vx = [dst_poly[i][0], dst_poly[j][0], dst_poly[k][0]]
+    vy = [dst_poly[i][1], dst_poly[j][1], dst_poly[k][1]]
+    a, b, tx = _mul_mat3_vec3(inv, vx)
+    c, d, ty = _mul_mat3_vec3(inv, vy)
+    return (a, b, c, d, tx, ty)
+
+
+def _apply_affine(
+    points: list[tuple[float, float]],
+    affine: tuple[float, float, float, float, float, float],
+) -> list[tuple[float, float]]:
+    a, b, c, d, tx, ty = affine
+    return [(a * x + b * y + tx, c * x + d * y + ty) for x, y in points]
+
+
 def _find_matching_edge_index(proj: Projection2D, shared_edge: SharedEdge) -> int | None:
     """Find which 2D edge in the projection corresponds to the shared 3D edge."""
     tol = 0.5
@@ -723,6 +817,7 @@ def export_svg(
     shared_edges: list[SharedEdge] | None = None,
     bottom_id: int | None = None,
     faces: list[PlanarFace] | None = None,
+    overlay_original: bool = False,
 ) -> str:
     """Export faces to SVG file with packed or edge-anchored folded layout."""
     import os
@@ -734,6 +829,7 @@ def export_svg(
         os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     parts = _prepare_parts(projections, modified_polygons, slot_cutouts)
+    part_by_fid = {p["fid"]: p for p in parts}
     geoms, actual_w, actual_h = _compute_arrangement(
         parts,
         layout=layout,
@@ -774,6 +870,37 @@ def export_svg(
                         stroke_width=stroke_width,
                     )
                 )
+
+        if overlay_original:
+            part = part_by_fid.get(g["fid"])
+            proj = projections.get(g["fid"])
+            if part is not None and proj is not None and len(part["polygon"]) >= 3 and len(g["polygon"]) >= 3:
+                affine = _solve_affine_from_corresponding_polygons(part["polygon"], g["polygon"])
+                if affine is not None and len(proj.outer_polygon) >= 3:
+                    orig_outer_local = [(x - part["min_x"], y - part["min_y"]) for x, y in proj.outer_polygon]
+                    orig_outer = _apply_affine(orig_outer_local, affine)
+                    group.add(
+                        dwg.polygon(
+                            orig_outer,
+                            fill="none",
+                            stroke="#00a651",
+                            stroke_width=max(0.2, stroke_width * 0.8),
+                        )
+                    )
+
+                    for inner in proj.inner_polygons:
+                        if len(inner) < 3:
+                            continue
+                        orig_inner_local = [(x - part["min_x"], y - part["min_y"]) for x, y in inner]
+                        orig_inner = _apply_affine(orig_inner_local, affine)
+                        group.add(
+                            dwg.polygon(
+                                orig_inner,
+                                fill="none",
+                                stroke="#00a651",
+                                stroke_width=max(0.2, stroke_width * 0.8),
+                            )
+                        )
 
         # Lego engravings (disabled for now)
         # _add_lego_engravings(dwg, group, g["polygon"], g.get("fid"), bottom_id)
