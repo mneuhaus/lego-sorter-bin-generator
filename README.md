@@ -2,6 +2,13 @@
 
 Generate laser-cut DXF/SVG files (including overlap verification views) from STEP models.
 
+## Joint Engine
+
+Joint booleans can be executed with either backend:
+
+1. `--joint-engine cadquery` (default): OCC/CadQuery face booleans
+2. `--joint-engine shapely`: legacy Shapely boolean path
+
 ## Overlap Baseline + Heatmap Diff
 
 Use this to catch visual regressions between runs.
