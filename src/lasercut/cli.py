@@ -55,7 +55,7 @@ def main():
     parser.add_argument(
         "--tab-direction",
         choices=[TAB_DIRECTION_OUTWARD, TAB_DIRECTION_INWARD],
-        default=TAB_DIRECTION_OUTWARD,
+        default=TAB_DIRECTION_INWARD,
         help=f"Positive tab style: {TAB_DIRECTION_OUTWARD} (legacy) or {TAB_DIRECTION_INWARD}",
     )
     parser.add_argument("--wall-offset", type=float, default=DEFAULT_FOLDED_OFFSET,

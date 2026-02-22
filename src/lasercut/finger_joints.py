@@ -1007,7 +1007,7 @@ def apply_finger_joints_fusion(
     notch_buffer: float = -1,
     plateau_inset: float = -1,
     min_plateau_length: float = -1,
-    tab_direction: str = TAB_DIRECTION_OUTWARD,
+    tab_direction: str = TAB_DIRECTION_INWARD,
     faces: list[PlanarFace] | None = None,
     fusion_params: FusionJointParams | None = None,
 ) -> tuple[dict[int, list[tuple[float, float]]], dict[int, list[list[tuple[float, float]]]]]:
