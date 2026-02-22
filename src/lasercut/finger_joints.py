@@ -609,15 +609,7 @@ def apply_finger_joints_fusion(
             continue
 
         owner_fingers, owner_slots, owner_lo, owner_hi = owner_intervals
-
         reversed_edge = _edges_reversed(owner_proj, owner_idx, mate_proj, mate_idx)
-        mate_slots = _map_intervals_by_param(owner_len, mate_len, owner_slots, reverse=reversed_edge)
-        mate_slots = _clip_intervals_to_terminal_margins(
-            mate_len,
-            mate_slots,
-            start_margin=terminal_margin,
-            end_margin=terminal_margin,
-        )
 
         owner_depth = thickness + kerf_half
         mate_depth = max(0.0, thickness - kerf_half)
@@ -632,6 +624,15 @@ def apply_finger_joints_fusion(
                 start_margin=terminal_margin,
                 end_margin=terminal_margin,
             )
+            # In inward mode, preserve full seam complement (including terminal
+            # bands): wherever owner is solid, mate must be recessed.
+            owner_full_contract = _complement_on_range(owner_notches, 0.0, owner_len)
+            mate_slots = _map_intervals_by_param(
+                owner_len,
+                mate_len,
+                owner_full_contract,
+                reverse=reversed_edge,
+            )
             owner_polys = _make_comb_from_intervals(
                 owner_p1,
                 owner_p2,
@@ -642,6 +643,13 @@ def apply_finger_joints_fusion(
             )
             sub_ops[owner_id].extend(owner_polys)
         else:
+            mate_slots = _map_intervals_by_param(owner_len, mate_len, owner_slots, reverse=reversed_edge)
+            mate_slots = _clip_intervals_to_terminal_margins(
+                mate_len,
+                mate_slots,
+                start_margin=terminal_margin,
+                end_margin=terminal_margin,
+            )
             owner_polys = _make_comb_from_intervals(
                 owner_p1,
                 owner_p2,
@@ -731,32 +739,9 @@ def apply_finger_joints_fusion(
                     continue
 
                 wall_fingers, wall_slots, wall_lo, wall_hi = wall_intervals
-                bottom_slots = _map_intervals_by_param(wall_len, slot_len, wall_slots, reverse=False)
-                bottom_slots = _clip_intervals_to_terminal_margins(
-                    slot_len,
-                    bottom_slots,
-                    start_margin=terminal_margin,
-                    end_margin=terminal_margin,
-                )
 
                 wall_depth = max(0.0, thickness - kerf_half)
                 slot_depth = thickness + kerf_half
-
-                # Bottom receives mapped slots.
-                bottom_out = _outward_direction(slot_start, slot_end, raw_shapes[bottom_id])
-                bottom_in = (-bottom_out[0], -bottom_out[1])
-                bottom_polys = _make_comb_from_intervals(
-                    slot_start,
-                    slot_end,
-                    slot_depth,
-                    bottom_in,
-                    bottom_slots,
-                    exclusion_zones=exclusion_zones.get(bottom_id, []),
-                )
-                sub_ops[bottom_id].extend(bottom_polys)
-
-                if wall_depth <= 1e-9:
-                    continue
 
                 wall_out = _outward_direction(wall_start, wall_end, raw_shapes[fid])
                 if tab_direction == TAB_DIRECTION_INWARD:
@@ -768,6 +753,30 @@ def apply_finger_joints_fusion(
                         start_margin=terminal_margin,
                         end_margin=terminal_margin,
                     )
+                    # Through-slot seam follows the same inward complement rule.
+                    wall_full_contract = _complement_on_range(wall_notches, 0.0, wall_len)
+                    bottom_slots = _map_intervals_by_param(
+                        wall_len,
+                        slot_len,
+                        wall_full_contract,
+                        reverse=False,
+                    )
+                    # Bottom receives mapped slots.
+                    bottom_out = _outward_direction(slot_start, slot_end, raw_shapes[bottom_id])
+                    bottom_in = (-bottom_out[0], -bottom_out[1])
+                    bottom_polys = _make_comb_from_intervals(
+                        slot_start,
+                        slot_end,
+                        slot_depth,
+                        bottom_in,
+                        bottom_slots,
+                        exclusion_zones=exclusion_zones.get(bottom_id, []),
+                    )
+                    sub_ops[bottom_id].extend(bottom_polys)
+
+                    if wall_depth <= 1e-9:
+                        continue
+
                     wall_polys = _make_comb_from_intervals(
                         wall_start,
                         wall_end,
@@ -778,6 +787,29 @@ def apply_finger_joints_fusion(
                     )
                     sub_ops[fid].extend(wall_polys)
                 else:
+                    bottom_slots = _map_intervals_by_param(wall_len, slot_len, wall_slots, reverse=False)
+                    bottom_slots = _clip_intervals_to_terminal_margins(
+                        slot_len,
+                        bottom_slots,
+                        start_margin=terminal_margin,
+                        end_margin=terminal_margin,
+                    )
+                    # Bottom receives mapped slots.
+                    bottom_out = _outward_direction(slot_start, slot_end, raw_shapes[bottom_id])
+                    bottom_in = (-bottom_out[0], -bottom_out[1])
+                    bottom_polys = _make_comb_from_intervals(
+                        slot_start,
+                        slot_end,
+                        slot_depth,
+                        bottom_in,
+                        bottom_slots,
+                        exclusion_zones=exclusion_zones.get(bottom_id, []),
+                    )
+                    sub_ops[bottom_id].extend(bottom_polys)
+
+                    if wall_depth <= 1e-9:
+                        continue
+
                     wall_polys = _make_comb_from_intervals(
                         wall_start,
                         wall_end,
