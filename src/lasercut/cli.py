@@ -5,8 +5,6 @@ import os
 import sys
 
 from .finger_joints import (
-    DEFAULT_EDGE_MARGIN,
-    DEFAULT_FINGER_WIDTH,
     DEFAULT_MIN_PLATEAU_LENGTH,
     DEFAULT_NOTCH_BUFFER,
     DEFAULT_PLATEAU_INSET,
@@ -31,8 +29,6 @@ def main():
                         help="Material thickness in mm (default: 3.0)")
     parser.add_argument("--kerf", type=float, default=0.0,
                         help="Laser kerf in mm for compensation (default: 0.0)")
-    parser.add_argument("--finger-width", type=float, default=0,
-                        help=f"Finger width in mm, 0 = auto ({DEFAULT_FINGER_WIDTH}mm)")
     parser.add_argument("--format", nargs="+", default=["dxf", "svg"],
                         choices=["dxf", "svg"],
                         help="Output formats (default: dxf svg)")
@@ -45,7 +41,7 @@ def main():
     parser.add_argument("--body", type=int, default=0,
                         help="Which body to process (0-based index, -1 for all, default: 0)")
     parser.add_argument("--edge-margin", type=float, default=-1,
-                        help=f"Safe zone at edge ends in mm, -1 = auto ({DEFAULT_EDGE_MARGIN}mm)")
+                        help=f"Safe zone at edge ends in mm, -1 = auto ({FUSION_DEFAULT_EDGE_MARGIN}mm)")
     parser.add_argument("--notch-buffer", type=float, default=-1,
                         help=f"Safe zone around notches in mm, -1 = auto ({DEFAULT_NOTCH_BUFFER}mm)")
     parser.add_argument("--plateau-inset", type=float, default=-1,
@@ -57,12 +53,6 @@ def main():
     parser.add_argument("--wall-offset", type=float, default=DEFAULT_FOLDED_OFFSET,
                         help=f"Gap from bottom plate to surrounding walls in folded layout (default: {DEFAULT_FOLDED_OFFSET}mm)")
     parser.add_argument(
-        "--joint-algorithm",
-        choices=["plateau", "fusion-overlap"],
-        default="plateau",
-        help="Joint generation model (default: plateau)",
-    )
-    parser.add_argument(
         "--fusion-placement",
         choices=[
             FUSION_PLACEMENT_FINGERS_OUTSIDE,
@@ -71,19 +61,19 @@ def main():
             FUSION_PLACEMENT_SAME_START_NOTCH,
         ],
         default=FUSION_PLACEMENT_FINGERS_OUTSIDE,
-        help="Fusion-style placement mode (used when --joint-algorithm fusion-overlap)",
+        help="Finger placement mode (default: fingers_outside)",
     )
     parser.add_argument(
         "--fusion-size-mode",
         choices=[FUSION_DYNAMIC_EQUAL, FUSION_DYNAMIC_FIXED_NOTCH, FUSION_DYNAMIC_FIXED_FINGER],
         default=FUSION_DYNAMIC_EQUAL,
-        help="Fusion-style sizing mode (used when --joint-algorithm fusion-overlap)",
+        help="Finger sizing mode (default: equal)",
     )
     parser.add_argument(
         "--fusion-count-mode",
         choices=["dynamic", "fixed"],
         default="dynamic",
-        help="Fusion-style finger count mode (used when --joint-algorithm fusion-overlap)",
+        help="Finger count mode (default: dynamic)",
     )
     parser.add_argument(
         "--fusion-fixed-num-fingers",
@@ -119,7 +109,7 @@ def main():
         "--fusion-gap",
         type=float,
         default=0.0,
-        help="Gap between fingers/notches in mm for fusion-overlap model",
+        help="Gap between fingers/notches in mm",
     )
 
     args = parser.parse_args()
@@ -133,12 +123,9 @@ def main():
     from .projector import project_face
     from .finger_joints import (
         FusionJointParams,
-        apply_finger_joints,
         apply_finger_joints_fusion,
     )
     from .exporter import export_dxf, export_svg
-
-    fw_display = args.finger_width if args.finger_width > 0 else DEFAULT_FINGER_WIDTH
 
     # Step 1: Load STEP and extract planar faces
     print(f"Loading STEP file: {args.input}")
@@ -195,77 +182,55 @@ def main():
     relevant_shared = [se for se in shared_edges
                        if se.face_a_id in relevant_ids and se.face_b_id in relevant_ids]
 
-    print(f"Applying finger joints ({len(relevant_shared)} shared edges)...")
-    print(f"  Thickness: {args.thickness} mm")
-    print(f"  Finger width: {fw_display} mm")
-    print(f"  Kerf: {args.kerf} mm")
-    if args.joint_algorithm == "fusion-overlap":
-        em_display = args.edge_margin if args.edge_margin >= 0 else FUSION_DEFAULT_EDGE_MARGIN
-    else:
-        em_display = args.edge_margin if args.edge_margin >= 0 else DEFAULT_EDGE_MARGIN
+    em_display = args.edge_margin if args.edge_margin >= 0 else FUSION_DEFAULT_EDGE_MARGIN
     nb_display = args.notch_buffer if args.notch_buffer >= 0 else DEFAULT_NOTCH_BUFFER
     pi_display = args.plateau_inset if args.plateau_inset >= 0 else DEFAULT_PLATEAU_INSET
     mpl_display = (args.min_plateau_length if args.min_plateau_length >= 0
                    else DEFAULT_MIN_PLATEAU_LENGTH)
+
+    print(f"Applying finger joints ({len(relevant_shared)} shared edges)...")
+    print(f"  Thickness: {args.thickness} mm")
+    print(f"  Kerf: {args.kerf} mm")
     print(f"  Edge margin: {em_display} mm")
     print(f"  Notch buffer: {nb_display} mm")
     print(f"  Plateau inset: {pi_display} mm")
     print(f"  Min plateau length: {mpl_display} mm")
     print(f"  Layout: {args.layout}")
-    print(f"  Joint algorithm: {args.joint_algorithm}")
-    if args.joint_algorithm == "fusion-overlap":
-        print(f"  Fusion placement: {args.fusion_placement}")
-        print(f"  Fusion size mode: {args.fusion_size_mode}")
-        print(f"  Fusion count mode: {args.fusion_count_mode}")
-        if args.fusion_count_mode == "fixed":
-            print(f"  Fusion fixed finger count: {args.fusion_fixed_num_fingers}")
-        print(f"  Fusion fixed finger size: {args.fusion_fixed_finger_size} mm")
-        print(f"  Fusion fixed notch size: {args.fusion_fixed_notch_size} mm")
-        print(f"  Fusion minimum finger size: {args.fusion_min_finger_size} mm")
-        print(f"  Fusion minimum notch size: {args.fusion_min_notch_size} mm")
-        print(f"  Fusion gap: {args.fusion_gap} mm")
+    print(f"  Placement: {args.fusion_placement}")
+    print(f"  Size mode: {args.fusion_size_mode}")
+    print(f"  Count mode: {args.fusion_count_mode}")
+    if args.fusion_count_mode == "fixed":
+        print(f"  Fixed finger count: {args.fusion_fixed_num_fingers}")
+    print(f"  Min finger size: {args.fusion_min_finger_size} mm")
+    print(f"  Min notch size: {args.fusion_min_notch_size} mm")
+    print(f"  Gap: {args.fusion_gap} mm")
     if args.layout == "folded":
         print(f"  Wall offset: {args.wall_offset} mm")
 
-    if args.joint_algorithm == "fusion-overlap":
-        fusion_params = FusionJointParams(
-            placement_type=args.fusion_placement,
-            dynamic_size_type=args.fusion_size_mode,
-            is_number_of_fingers_fixed=(args.fusion_count_mode == "fixed"),
-            fixed_num_fingers=args.fusion_fixed_num_fingers,
-            fixed_finger_size=args.fusion_fixed_finger_size,
-            fixed_notch_size=args.fusion_fixed_notch_size,
-            min_finger_size=args.fusion_min_finger_size,
-            min_notch_size=args.fusion_min_notch_size,
-            gap=args.fusion_gap,
-        )
-        modified_polygons, slot_cutouts = apply_finger_joints_fusion(
-            projections,
-            relevant_shared,
-            bottom_id=bottom.face_id,
-            thickness=args.thickness,
-            kerf=args.kerf,
-            edge_margin=args.edge_margin,
-            notch_buffer=args.notch_buffer,
-            plateau_inset=args.plateau_inset,
-            min_plateau_length=args.min_plateau_length,
-            faces=faces,
-            fusion_params=fusion_params,
-        )
-    else:
-        modified_polygons, slot_cutouts = apply_finger_joints(
-            projections, relevant_shared,
-            bottom_id=bottom.face_id,
-            thickness=args.thickness,
-            finger_width=args.finger_width,
-            kerf=args.kerf,
-            edge_margin=args.edge_margin,
-            notch_buffer=args.notch_buffer,
-            plateau_inset=args.plateau_inset,
-            min_plateau_length=args.min_plateau_length,
-            faces=faces,
-            all_shared_edges=shared_edges,
-        )
+    fusion_params = FusionJointParams(
+        placement_type=args.fusion_placement,
+        dynamic_size_type=args.fusion_size_mode,
+        is_number_of_fingers_fixed=(args.fusion_count_mode == "fixed"),
+        fixed_num_fingers=args.fusion_fixed_num_fingers,
+        fixed_finger_size=args.fusion_fixed_finger_size,
+        fixed_notch_size=args.fusion_fixed_notch_size,
+        min_finger_size=args.fusion_min_finger_size,
+        min_notch_size=args.fusion_min_notch_size,
+        gap=args.fusion_gap,
+    )
+    modified_polygons, slot_cutouts = apply_finger_joints_fusion(
+        projections,
+        relevant_shared,
+        bottom_id=bottom.face_id,
+        thickness=args.thickness,
+        kerf=args.kerf,
+        edge_margin=args.edge_margin,
+        notch_buffer=args.notch_buffer,
+        plateau_inset=args.plateau_inset,
+        min_plateau_length=args.min_plateau_length,
+        faces=faces,
+        fusion_params=fusion_params,
+    )
 
     # Report through-slots
     for fid, slots in slot_cutouts.items():
