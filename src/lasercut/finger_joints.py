@@ -623,8 +623,8 @@ def apply_finger_joints(
         shape = _polygon_to_shapely(proj.outer_polygon, proj.inner_polygons)
         raw_shapes[fid] = shape
         # Morphological smoothing to remove 3D-model ledge artifacts.
-        # Use 1.5x thickness to cover ledges slightly deeper than nominal.
-        close_dist = thickness * 1.5
+        # Use 1x thickness so curved features (arcs ~4mm) survive the opening.
+        close_dist = thickness
         if fid == bottom_id:
             # Bottom plate: closing (fills notch indentations from wall ledges)
             closed = shape.buffer(close_dist, join_style='mitre').buffer(-close_dist, join_style='mitre')
