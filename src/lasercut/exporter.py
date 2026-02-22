@@ -925,6 +925,7 @@ def _build_overlay_panel(
     label: str,
     orig_a: dict | None = None,
     orig_b: dict | None = None,
+    mesh_offset: float = 0.0,
 ) -> dict | None:
     """Build one overlap-debug panel by aligning B's edge onto A's edge."""
     ap1_local = _pt_to_local(part_a, a_edge[0])
@@ -961,13 +962,7 @@ def _build_overlay_panel(
         b_holes = [_reflect_points_across_line(h, ap1_local, ap2_local) for h in b_holes]
         b_orig_outer = _reflect_points_across_line(b_orig_outer, ap1_local, ap2_local)
         b_orig_holes = [_reflect_points_across_line(h, ap1_local, ap2_local) for h in b_orig_holes]
-
-    xs = [p[0] for p in a_poly] + [p[0] for p in b_poly]
-    ys = [p[1] for p in a_poly] + [p[1] for p in b_poly]
-    if not xs or not ys:
-        return None
-    min_x, max_x = min(xs), max(xs)
-    min_y, max_y = min(ys), max(ys)
+        b_side = _side(_centroid(b_poly), ap1_local, ap2_local)
 
     edge_len = _dist_2d(ap1_local, ap2_local)
     if edge_len < 1e-9:
@@ -977,23 +972,49 @@ def _build_overlay_panel(
     nx = -uy
     ny = ux
 
-    # Clip visualization to the seam span (between edge endpoints) so adjacent
-    # corner features do not appear as false seam mismatches.
-    seam_trim = 0.1
-    if edge_len > 2.0 * seam_trim:
-        cp1 = (ap1_local[0] + ux * seam_trim, ap1_local[1] + uy * seam_trim)
-        cp2 = (ap2_local[0] - ux * seam_trim, ap2_local[1] - uy * seam_trim)
-    else:
-        cp1 = ap1_local
-        cp2 = ap2_local
+    # For inward-tab verification, shift one mate inward by material thickness
+    # so mesh fit is visible instead of seam-coincident "gap" appearance.
+    if mesh_offset > 1e-9:
+        b_sign = 1.0 if b_side >= 0 else -1.0
+        dx = -b_sign * nx * mesh_offset
+        dy = -b_sign * ny * mesh_offset
+        b_poly = _shift_points(b_poly, dx, dy)
+        b_holes = [_shift_points(h, dx, dy) for h in b_holes]
+        b_orig_outer = _shift_points(b_orig_outer, dx, dy)
+        b_orig_holes = [_shift_points(h, dx, dy) for h in b_orig_holes]
 
-    normal_span = max(max_x - min_x, max_y - min_y) + 10.0
+    seam_pts = a_poly + b_poly
+    if not seam_pts:
+        return None
+    seam_xs = [p[0] for p in seam_pts]
+    seam_ys = [p[1] for p in seam_pts]
+    seam_min_x, seam_max_x = min(seam_xs), max(seam_xs)
+    seam_min_y, seam_max_y = min(seam_ys), max(seam_ys)
+
+    # Clip visualization to the exact seam span. Endpoint trimming caused
+    # misleading tiny stubs at seam ends in the verifier.
+    cp1 = ap1_local
+    cp2 = ap2_local
+
+    normal_span = max(seam_max_x - seam_min_x, seam_max_y - seam_min_y) + 10.0
     clip_strip = [
         (cp1[0] - nx * normal_span, cp1[1] - ny * normal_span),
         (cp2[0] - nx * normal_span, cp2[1] - ny * normal_span),
         (cp2[0] + nx * normal_span, cp2[1] + ny * normal_span),
         (cp1[0] + nx * normal_span, cp1[1] + ny * normal_span),
     ]
+
+    panel_pts = list(a_poly) + list(b_poly)
+    panel_pts.extend(a_orig_outer)
+    panel_pts.extend(b_orig_outer)
+    for hole in a_holes + b_holes + a_orig_holes + b_orig_holes:
+        panel_pts.extend(hole)
+    if not panel_pts:
+        return None
+    xs = [p[0] for p in panel_pts]
+    ys = [p[1] for p in panel_pts]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
 
     return {
         "label": label,
@@ -1022,6 +1043,7 @@ def export_svg_overlap_debug(
     shared_edges: list[SharedEdge] | None = None,
     bottom_id: int | None = None,
     faces: list[PlanarFace] | None = None,
+    mesh_offset: float = 0.0,
     panel_padding: float = 8.0,
     panel_gap: float = 12.0,
 ) -> str:
@@ -1079,6 +1101,7 @@ def export_svg_overlap_debug(
                 label=f"shared-{i}: {part_a['label']} vs {part_b['label']}",
                 orig_a=orig_by_fid.get(fid_a),
                 orig_b=orig_by_fid.get(fid_b),
+                mesh_offset=mesh_offset,
             )
             if panel is not None:
                 panels.append(panel)
@@ -1113,6 +1136,7 @@ def export_svg_overlap_debug(
                 label=f"through: {bottom_part['label']} vs {wall_part['label']}",
                 orig_a=orig_by_fid.get(bottom_id),
                 orig_b=orig_by_fid.get(wall_id),
+                mesh_offset=mesh_offset,
             )
             if panel is not None:
                 panels.append(panel)
@@ -1155,6 +1179,30 @@ def export_svg_overlap_debug(
         size=(f"{canvas_w:.1f}mm", f"{canvas_h:.1f}mm"),
         viewBox=f"0 0 {canvas_w:.1f} {canvas_h:.1f}",
     )
+    a_fill = "#1f4aa8"
+    b_fill = "#b71f4a"
+    a_hatch = "#4f86ff"
+    b_hatch = "#ff5f86"
+
+    hatch_a = dwg.defs.add(
+        dwg.pattern(
+            id="overlay_hatch_a",
+            size=(6, 6),
+            patternUnits="userSpaceOnUse",
+            patternTransform="rotate(35)",
+        )
+    )
+    hatch_a.add(dwg.line(start=(0, 0), end=(0, 6), stroke=a_hatch, stroke_width=1.0, stroke_opacity=0.9))
+
+    hatch_b = dwg.defs.add(
+        dwg.pattern(
+            id="overlay_hatch_b",
+            size=(6, 6),
+            patternUnits="userSpaceOnUse",
+            patternTransform="rotate(-35)",
+        )
+    )
+    hatch_b.add(dwg.line(start=(0, 0), end=(0, 6), stroke=b_hatch, stroke_width=1.0, stroke_opacity=0.9))
 
     for idx, panel in enumerate(panels):
         group = dwg.g(id=panel["label"].replace(" ", "_"))
@@ -1167,8 +1215,16 @@ def export_svg_overlap_debug(
         shapes_group.add(
             dwg.polygon(
                 panel["a_poly"],
-                fill="#1f77b4",
-                fill_opacity=0.5,
+                fill=a_fill,
+                fill_opacity=0.34,
+                stroke="none",
+            )
+        )
+        shapes_group.add(
+            dwg.polygon(
+                panel["a_poly"],
+                fill="url(#overlay_hatch_a)",
+                fill_opacity=1.0,
                 stroke="none",
             )
         )
@@ -1178,7 +1234,7 @@ def export_svg_overlap_debug(
                     hole,
                     fill="white",
                     fill_opacity=1.0,
-                    stroke="#1f77b4",
+                    stroke=a_fill,
                     stroke_width=0.25,
                 )
             )
@@ -1186,8 +1242,16 @@ def export_svg_overlap_debug(
         shapes_group.add(
             dwg.polygon(
                 panel["b_poly"],
-                fill="#d62728",
-                fill_opacity=0.5,
+                fill=b_fill,
+                fill_opacity=0.34,
+                stroke="none",
+            )
+        )
+        shapes_group.add(
+            dwg.polygon(
+                panel["b_poly"],
+                fill="url(#overlay_hatch_b)",
+                fill_opacity=1.0,
                 stroke="none",
             )
         )
@@ -1197,12 +1261,64 @@ def export_svg_overlap_debug(
                     hole,
                     fill="white",
                     fill_opacity=1.0,
-                    stroke="#d62728",
+                    stroke=b_fill,
                     stroke_width=0.25,
                 )
             )
 
         group.add(shapes_group)
+
+        # Draw explicit modified-geometry outlines so edge-to-edge fit is easy
+        # to inspect without relying on fill blending perception.
+        mod_outline_group = dwg.g()
+        mod_outline_group.update({"clip-path": f"url(#{clip_id})"})
+        mod_outline_group.add(
+            dwg.polygon(
+                panel["a_poly"],
+                fill="none",
+                stroke=a_fill,
+                stroke_width=0.42,
+                stroke_linecap="butt",
+                stroke_linejoin="miter",
+            )
+        )
+        for hole in panel["a_holes"]:
+            if len(hole) < 3:
+                continue
+            mod_outline_group.add(
+                dwg.polygon(
+                    hole,
+                    fill="none",
+                    stroke=a_fill,
+                    stroke_width=0.32,
+                    stroke_linecap="butt",
+                    stroke_linejoin="miter",
+                )
+            )
+        mod_outline_group.add(
+            dwg.polygon(
+                panel["b_poly"],
+                fill="none",
+                stroke=b_fill,
+                stroke_width=0.42,
+                stroke_linecap="butt",
+                stroke_linejoin="miter",
+            )
+        )
+        for hole in panel["b_holes"]:
+            if len(hole) < 3:
+                continue
+            mod_outline_group.add(
+                dwg.polygon(
+                    hole,
+                    fill="none",
+                    stroke=b_fill,
+                    stroke_width=0.32,
+                    stroke_linecap="butt",
+                    stroke_linejoin="miter",
+                )
+            )
+        group.add(mod_outline_group)
 
         outline_group = dwg.g()
         outline_group.update({"clip-path": f"url(#{clip_id})"})
@@ -1214,6 +1330,8 @@ def export_svg_overlap_debug(
                     stroke="#00a651",
                     stroke_width=0.28,
                     stroke_dasharray="2,2",
+                    stroke_linecap="butt",
+                    stroke_linejoin="miter",
                 )
             )
         for hole in panel["a_orig_holes"]:
@@ -1226,6 +1344,8 @@ def export_svg_overlap_debug(
                     stroke="#00a651",
                     stroke_width=0.24,
                     stroke_dasharray="2,2",
+                    stroke_linecap="butt",
+                    stroke_linejoin="miter",
                 )
             )
         if len(panel["b_orig_outer"]) >= 3:
@@ -1236,6 +1356,8 @@ def export_svg_overlap_debug(
                     stroke="#00a651",
                     stroke_width=0.28,
                     stroke_dasharray="2,2",
+                    stroke_linecap="butt",
+                    stroke_linejoin="miter",
                 )
             )
         for hole in panel["b_orig_holes"]:
@@ -1248,6 +1370,8 @@ def export_svg_overlap_debug(
                     stroke="#00a651",
                     stroke_width=0.24,
                     stroke_dasharray="2,2",
+                    stroke_linecap="butt",
+                    stroke_linejoin="miter",
                 )
             )
         group.add(outline_group)
@@ -1259,6 +1383,7 @@ def export_svg_overlap_debug(
                 stroke="black",
                 stroke_width=0.45,
                 stroke_dasharray="1,1",
+                stroke_linecap="butt",
             )
         )
         text_pos = (panel["edge"][0][0] + 2.0, min(panel["edge"][0][1], panel["edge"][1][1]) - 1.5)

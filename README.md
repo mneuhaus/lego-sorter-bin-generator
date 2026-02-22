@@ -1,0 +1,37 @@
+# lasercut-generator
+
+Generate laser-cut DXF/SVG files (including overlap verification views) from STEP models.
+
+## Overlap Baseline + Heatmap Diff
+
+Use this to catch visual regressions between runs.
+
+1. Create/update baseline from current overlap verifier output:
+
+```bash
+uv run python -m lasercut.cli step_files/bin_third_center.step \
+  --format svg \
+  --output output \
+  --svg-overlay-original \
+  --svg-verify-overlap \
+  --svg-verify-overlap-baseline output/baselines/bin_third_center-overlap.svg \
+  --svg-verify-overlap-update-baseline
+```
+
+2. Compare current run against baseline and generate heatmap diff artifacts:
+
+```bash
+uv run python -m lasercut.cli step_files/bin_third_center.step \
+  --format svg \
+  --output output \
+  --svg-overlay-original \
+  --svg-verify-overlap \
+  --svg-verify-overlap-baseline output/baselines/bin_third_center-overlap.svg \
+  --svg-verify-overlap-diff
+```
+
+Generated files:
+
+1. `output/lasercut-verify-overlap-diff-heatmap.png` - raw heatmap of differences
+2. `output/lasercut-verify-overlap-diff-overlay.png` - current overlap view with diff overlay
+3. `output/lasercut-verify-overlap-diff-summary.json` - changed-pixel stats

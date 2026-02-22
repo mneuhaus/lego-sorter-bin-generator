@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import shutil
 import sys
 
 from .finger_joints import (
@@ -74,6 +75,33 @@ def main():
         ),
     )
     parser.add_argument(
+        "--svg-verify-overlap-baseline",
+        default=None,
+        help="Path to baseline overlap SVG used for regression diff/updates",
+    )
+    parser.add_argument(
+        "--svg-verify-overlap-diff",
+        action="store_true",
+        help="Create heatmap-style diff images against --svg-verify-overlap-baseline",
+    )
+    parser.add_argument(
+        "--svg-verify-overlap-update-baseline",
+        action="store_true",
+        help="Overwrite --svg-verify-overlap-baseline with current overlap SVG after export",
+    )
+    parser.add_argument(
+        "--svg-verify-overlap-diff-threshold",
+        type=int,
+        default=10,
+        help="Pixel diff threshold [0-255] for overlap heatmap (default: 10)",
+    )
+    parser.add_argument(
+        "--svg-verify-overlap-diff-scale",
+        type=float,
+        default=3.0,
+        help="Render scale in px/mm for overlap heatmap diff (default: 3.0)",
+    )
+    parser.add_argument(
         "--fusion-placement",
         choices=[
             FUSION_PLACEMENT_FINGERS_OUTSIDE,
@@ -138,6 +166,18 @@ def main():
     if not os.path.exists(args.input):
         print(f"Error: Input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+    if (args.svg_verify_overlap_diff or args.svg_verify_overlap_update_baseline) and not args.svg_verify_overlap:
+        print(
+            "Error: --svg-verify-overlap-diff/update-baseline requires --svg-verify-overlap",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if (args.svg_verify_overlap_diff or args.svg_verify_overlap_update_baseline) and not args.svg_verify_overlap_baseline:
+        print(
+            "Error: --svg-verify-overlap-baseline is required for diff/update-baseline",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     from .step_loader import load_step
     from .face_classifier import find_shared_edges, classify_faces
@@ -146,6 +186,7 @@ def main():
         FusionJointParams,
         apply_finger_joints_fusion,
     )
+    from .overlap_diff import create_overlap_diff_heatmap
     from .exporter import export_dxf, export_svg, export_svg_overlap_debug
 
     # Step 1: Load STEP and extract planar faces
@@ -313,9 +354,52 @@ def main():
                 shared_edges=relevant_shared,
                 bottom_id=bottom.face_id,
                 faces=faces,
+                mesh_offset=args.thickness if args.tab_direction == TAB_DIRECTION_INWARD else 0.0,
             )
             written.append(verify_file)
             print(f"  Written: {verify_file}")
+
+            if args.svg_verify_overlap_diff:
+                baseline_path = os.path.abspath(args.svg_verify_overlap_baseline)
+                if not os.path.exists(baseline_path):
+                    print(
+                        f"  Baseline not found (skip diff): {baseline_path}",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                print("Generating overlap heatmap diff...")
+                diff_artifacts = create_overlap_diff_heatmap(
+                    current_svg_path=verify_file,
+                    baseline_svg_path=baseline_path,
+                    output_dir=args.output,
+                    output_prefix="lasercut-verify-overlap",
+                    px_per_mm=args.svg_verify_overlap_diff_scale,
+                    diff_threshold=args.svg_verify_overlap_diff_threshold,
+                )
+                for key in (
+                    "current_png",
+                    "baseline_png",
+                    "diff_gray_png",
+                    "diff_mask_png",
+                    "diff_heatmap_png",
+                    "diff_overlay_png",
+                    "diff_summary_json",
+                ):
+                    path = diff_artifacts[key]
+                    written.append(path)
+                    print(f"  Written: {path}")
+                print(
+                    "  Diff summary: "
+                    f"{diff_artifacts['changed_pixels']} / {diff_artifacts['total_pixels']} px "
+                    f"changed ({diff_artifacts['changed_ratio'] * 100:.4f}%)"
+                )
+
+            if args.svg_verify_overlap_update_baseline:
+                baseline_path = os.path.abspath(args.svg_verify_overlap_baseline)
+                os.makedirs(os.path.dirname(baseline_path) or ".", exist_ok=True)
+                shutil.copyfile(verify_file, baseline_path)
+                written.append(baseline_path)
+                print(f"  Updated baseline: {baseline_path}")
 
     print(f"\nDone! {len(written)} file(s) written to {args.output}/")
 
