@@ -885,6 +885,7 @@ def export_svg(
                             fill="none",
                             stroke="#00a651",
                             stroke_width=max(0.2, stroke_width * 0.8),
+                            stroke_dasharray="2,2",
                         )
                     )
 
@@ -899,6 +900,7 @@ def export_svg(
                                 fill="none",
                                 stroke="#00a651",
                                 stroke_width=max(0.2, stroke_width * 0.8),
+                                stroke_dasharray="2,2",
                             )
                         )
 

@@ -888,6 +888,49 @@ def _complement_notch_intervals(
     return notches
 
 
+def _clip_intervals_to_terminal_margins(
+    edge_len: float,
+    intervals: list[tuple[float, float]],
+    start_margin: float = 0.0,
+    end_margin: float = 0.0,
+    eps: float = 1e-6,
+) -> list[tuple[float, float]]:
+    """Clip intervals to [start_margin, edge_len - end_margin] and merge."""
+    if edge_len <= eps or not intervals:
+        return []
+
+    lo = max(0.0, start_margin)
+    hi = edge_len - max(0.0, end_margin)
+    if hi <= lo + eps:
+        return []
+
+    clipped: list[tuple[float, float]] = []
+    for start, width in intervals:
+        if width <= eps:
+            continue
+        s = max(lo, start)
+        e = min(hi, start + width)
+        if e > s + eps:
+            clipped.append((s, e - s))
+
+    if not clipped:
+        return []
+
+    merged: list[tuple[float, float]] = []
+    for start, width in sorted(clipped):
+        end = start + width
+        if not merged:
+            merged.append((start, width))
+            continue
+        ps, pw = merged[-1]
+        pe = ps + pw
+        if start <= pe + eps:
+            merged[-1] = (ps, max(pe, end) - ps)
+        else:
+            merged.append((start, width))
+    return merged
+
+
 def apply_finger_joints_fusion(
     projections: dict[int, Projection2D],
     shared_edges: list[SharedEdge],
@@ -928,15 +971,19 @@ def apply_finger_joints_fusion(
     for fid, proj in projections.items():
         shape = _polygon_to_shapely(proj.outer_polygon, proj.inner_polygons)
         raw_shapes[fid] = shape
-        close_dist = thickness * 1.5
-        if fid == bottom_id:
-            cleaned = shape.buffer(close_dist, join_style='mitre').buffer(-close_dist, join_style='mitre')
-        else:
-            cleaned = shape.buffer(-close_dist, join_style='mitre').buffer(close_dist, join_style='mitre')
-        if not cleaned.is_empty and cleaned.is_valid:
-            if isinstance(cleaned, MultiPolygon):
-                cleaned = max(cleaned.geoms, key=lambda g: g.area)
-            shape = cleaned
+        # Morphological cleanup is intentionally disabled by default.
+        # Earlier cleanup passes (buffer/unbuffer) could introduce fake radii
+        # or flatten true STEP radii, causing dimension-debug overlay drift.
+        close_dist = 0.0
+        if close_dist > 1e-9:
+            if fid == bottom_id:
+                cleaned = shape.buffer(close_dist, join_style='mitre').buffer(-close_dist, join_style='mitre')
+            else:
+                cleaned = shape.buffer(-close_dist, join_style='mitre').buffer(close_dist, join_style='mitre')
+            if not cleaned.is_empty and cleaned.is_valid:
+                if isinstance(cleaned, MultiPolygon):
+                    cleaned = max(cleaned.geoms, key=lambda g: g.area)
+                shape = cleaned
         shapes[fid] = shape
 
     exclusion_zones: dict[int, list[Polygon]] = {}
@@ -1045,9 +1092,17 @@ def apply_finger_joints_fusion(
         outward_pos = _outward_direction(pos_p1, pos_p2, shapes[pos_id])
         if tab_direction == TAB_DIRECTION_INWARD:
             inward_pos = (-outward_pos[0], -outward_pos[1])
-            # In inward mode, notch everywhere fingers are absent so positive
-            # geometry always mates with slot intervals on the opposite face.
-            pos_notch_intervals = _complement_notch_intervals(pos_len, pos_finger_intervals)
+            # Build inward notches from local fusion segments so margins stay
+            # flat (no tiny end notches) and segment boundaries are respected.
+            pos_notch_intervals = _build_inward_notch_intervals_for_segments(
+                pos_len,
+                fusion_params,
+                segments_t=shared_pos,
+                margin=edge_margin,
+                start_margin=shared_start_margin,
+                end_margin=shared_end_margin,
+                min_segment_length=min_plateau_length,
+            )
             pos_notches = _make_comb_from_intervals(
                 pos_p1, pos_p2, pos_depth, inward_pos, pos_notch_intervals,
                 exclusion_zones=exclusion_zones.get(pos_id, []),
@@ -1192,9 +1247,18 @@ def apply_finger_joints_fusion(
                 outward_wall = _outward_direction(wall_start, wall_end, shapes[fid])
                 if tab_direction == TAB_DIRECTION_INWARD:
                     inward_wall = (-outward_wall[0], -outward_wall[1])
-                    # Keep through-slot wall fingers exactly complementary to
-                    # bottom slot intervals to prevent unmatched end fingers.
+                    # Through-slot walls need full complement notches so the
+                    # remaining edge spans act as actual through-tabs that mate
+                    # with bottom slots (including single-finger cases).
                     wall_notch_intervals = _complement_notch_intervals(wall_len, finger_intervals)
+                    # Keep corner-safe terminal margins clear so through-slot
+                    # notches do not distort adjacent wall-wall edge features.
+                    wall_notch_intervals = _clip_intervals_to_terminal_margins(
+                        wall_len,
+                        wall_notch_intervals,
+                        start_margin=shared_start_margin,
+                        end_margin=shared_end_margin,
+                    )
                     wall_notches = _make_comb_from_intervals(
                         wall_start, wall_end, tab_depth, inward_wall, wall_notch_intervals,
                         exclusion_zones=exclusion_zones.get(fid, []),
