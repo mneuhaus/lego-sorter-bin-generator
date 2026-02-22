@@ -775,8 +775,8 @@ def export_svg(
                     )
                 )
 
-        # Lego engravings
-        _add_lego_engravings(dwg, group, g["polygon"], g.get("fid"), bottom_id)
+        # Lego engravings (disabled for now)
+        # _add_lego_engravings(dwg, group, g["polygon"], g.get("fid"), bottom_id)
 
         dwg.add(group)
 
