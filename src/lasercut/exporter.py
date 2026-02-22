@@ -566,6 +566,151 @@ def export_dxf(
     return written
 
 
+def _add_lego_engravings(dwg, group, polygon, fid, bottom_id):
+    """Add decorative Lego-themed engravings inside a face polygon."""
+    from shapely.geometry import Polygon as SPoly, Point as SPoint
+
+    if len(polygon) < 3:
+        return
+
+    poly = SPoly(polygon)
+    if poly.is_empty or not poly.is_valid:
+        return
+
+    bounds = poly.bounds  # (minx, miny, maxx, maxy)
+    w = bounds[2] - bounds[0]
+    h = bounds[3] - bounds[1]
+    cx = (bounds[0] + bounds[2]) / 2
+    cy = (bounds[1] + bounds[3]) / 2
+
+    engrave_color = "red"
+    engrave_width = 0.3
+
+    is_bottom = fid == bottom_id
+
+    if is_bottom:
+        # Bottom plate: grid of Lego studs
+        stud_r = 4.8 / 2  # classic stud radius
+        spacing = 8.0  # standard Lego pitch
+        inner_r = stud_r * 0.55
+
+        # Offset grid to center on the polygon
+        ox = bounds[0] + ((w % spacing) / 2) + spacing / 2
+        oy = bounds[1] + ((h % spacing) / 2) + spacing / 2
+
+        y = oy
+        while y < bounds[3] - spacing / 4:
+            x = ox
+            while x < bounds[2] - spacing / 4:
+                pt = SPoint(x, y)
+                if poly.contains(pt) and poly.boundary.distance(pt) > stud_r + 1.5:
+                    group.add(dwg.circle(
+                        center=(x, y), r=stud_r,
+                        fill="none", stroke=engrave_color,
+                        stroke_width=engrave_width,
+                    ))
+                    group.add(dwg.circle(
+                        center=(x, y), r=inner_r,
+                        fill="none", stroke=engrave_color,
+                        stroke_width=engrave_width * 0.6,
+                    ))
+                x += spacing
+            y += spacing
+    else:
+        # Walls: brick pattern
+        brick_h = 8.0
+        brick_w = 16.0
+        margin = 6.0
+
+        # Inset polygon for pattern boundary
+        inset = poly.buffer(-margin)
+        if inset.is_empty:
+            return
+        from shapely.geometry import MultiPolygon as MPolygon
+        if isinstance(inset, MPolygon):
+            inset = max(inset.geoms, key=lambda g: g.area)
+
+        ib = inset.bounds
+        iw = ib[2] - ib[0]
+        ih = ib[3] - ib[1]
+
+        if iw < brick_w or ih < brick_h * 1.5:
+            return
+
+        # Draw horizontal mortar lines
+        row = 0
+        y = ib[1] + brick_h
+        while y < ib[3] - 1:
+            from shapely.geometry import LineString
+            line = LineString([(ib[0], y), (ib[2], y)])
+            clipped = line.intersection(inset)
+            if not clipped.is_empty:
+                if clipped.geom_type == "LineString":
+                    coords = list(clipped.coords)
+                    if len(coords) >= 2:
+                        group.add(dwg.line(
+                            start=coords[0], end=coords[-1],
+                            stroke=engrave_color, stroke_width=engrave_width,
+                        ))
+                elif clipped.geom_type == "MultiLineString":
+                    for seg in clipped.geoms:
+                        coords = list(seg.coords)
+                        if len(coords) >= 2:
+                            group.add(dwg.line(
+                                start=coords[0], end=coords[-1],
+                                stroke=engrave_color, stroke_width=engrave_width,
+                            ))
+
+            # Draw vertical mortar lines (staggered)
+            offset = (brick_w / 2) if (row % 2 == 1) else 0
+            prev_y = y - brick_h
+            x = ib[0] + offset + brick_w
+            while x < ib[2] - 1:
+                top = (x, prev_y)
+                bot = (x, y)
+                from shapely.geometry import LineString as LS
+                vline = LS([top, bot])
+                vclipped = vline.intersection(inset)
+                if not vclipped.is_empty:
+                    if vclipped.geom_type == "LineString":
+                        vc = list(vclipped.coords)
+                        if len(vc) >= 2:
+                            group.add(dwg.line(
+                                start=vc[0], end=vc[-1],
+                                stroke=engrave_color, stroke_width=engrave_width,
+                            ))
+                    elif vclipped.geom_type == "MultiLineString":
+                        for seg in vclipped.geoms:
+                            vc = list(seg.coords)
+                            if len(vc) >= 2:
+                                group.add(dwg.line(
+                                    start=vc[0], end=vc[-1],
+                                    stroke=engrave_color, stroke_width=engrave_width,
+                                ))
+                x += brick_w
+
+            row += 1
+            y += brick_h
+
+        # Top row vertical lines (from last horizontal line to top of inset)
+        last_y = ib[1] + brick_h * row
+        if last_y < ib[3]:
+            offset = (brick_w / 2) if (row % 2 == 1) else 0
+            x = ib[0] + offset + brick_w
+            while x < ib[2] - 1:
+                from shapely.geometry import LineString as LS2
+                vline = LS2([(x, last_y), (x, ib[3])])
+                vclipped = vline.intersection(inset)
+                if not vclipped.is_empty and vclipped.geom_type == "LineString":
+                    vc = list(vclipped.coords)
+                    if len(vc) >= 2:
+                        group.add(dwg.line(
+                            start=vc[0], end=vc[-1],
+                            stroke=engrave_color, stroke_width=engrave_width,
+                        ))
+                x += brick_w
+
+
 def export_svg(
     projections: dict[int, Projection2D],
     modified_polygons: dict[int, list[tuple[float, float]]],
@@ -630,18 +775,9 @@ def export_svg(
                     )
                 )
 
-        min_y = min(y for _, y in g["polygon"]) if g["polygon"] else 0.0
-        max_y = max(y for _, y in g["polygon"]) if g["polygon"] else 0.0
-        min_x = min(x for x, _ in g["polygon"]) if g["polygon"] else 0.0
-        group.add(
-            dwg.text(
-                g["label"],
-                insert=(min_x + 2, max_y + 4),
-                font_size="3",
-                font_family="monospace",
-                fill="blue",
-            )
-        )
+        # Lego engravings
+        _add_lego_engravings(dwg, group, g["polygon"], g.get("fid"), bottom_id)
+
         dwg.add(group)
 
     dwg.save()
