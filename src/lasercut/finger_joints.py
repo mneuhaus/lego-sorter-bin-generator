@@ -841,9 +841,25 @@ def _make_comb_from_intervals(
         ])
         if not rect.is_valid or rect.area <= 0:
             continue
-        if exclusion_zones and any(rect.intersects(z) for z in exclusion_zones):
-            continue
-        teeth.append(rect)
+        geom = rect
+        if exclusion_zones:
+            clipped = rect.difference(unary_union(exclusion_zones))
+            if clipped.is_empty:
+                continue
+            geom = clipped
+
+        if isinstance(geom, Polygon):
+            candidates = [geom]
+        elif isinstance(geom, MultiPolygon):
+            candidates = list(geom.geoms)
+        elif isinstance(geom, GeometryCollection):
+            candidates = [g for g in geom.geoms if isinstance(g, Polygon) and not g.is_empty]
+        else:
+            candidates = []
+
+        for poly in candidates:
+            if poly.is_valid and poly.area > 1e-9:
+                teeth.append(poly)
 
     return teeth
 
@@ -931,6 +947,56 @@ def _clip_intervals_to_terminal_margins(
     return merged
 
 
+def _map_intervals_by_param(
+    src_len: float,
+    dst_len: float,
+    intervals: list[tuple[float, float]],
+    reverse: bool = False,
+    eps: float = 1e-6,
+) -> list[tuple[float, float]]:
+    """Map absolute intervals from one edge parameterization to another."""
+    if src_len <= eps or dst_len <= eps or not intervals:
+        return []
+
+    mapped: list[tuple[float, float]] = []
+    for start, width in intervals:
+        if width <= eps:
+            continue
+        s = max(0.0, start)
+        e = min(src_len, start + width)
+        if e <= s + eps:
+            continue
+
+        t0 = s / src_len
+        t1 = e / src_len
+        if reverse:
+            m0 = dst_len * (1.0 - t1)
+            m1 = dst_len * (1.0 - t0)
+        else:
+            m0 = dst_len * t0
+            m1 = dst_len * t1
+
+        if m1 > m0 + eps:
+            mapped.append((m0, m1 - m0))
+
+    if not mapped:
+        return []
+
+    merged: list[tuple[float, float]] = []
+    for start, width in sorted(mapped):
+        end = start + width
+        if not merged:
+            merged.append((start, width))
+            continue
+        ps, pw = merged[-1]
+        pe = ps + pw
+        if start <= pe + eps:
+            merged[-1] = (ps, max(pe, end) - ps)
+        else:
+            merged.append((start, width))
+    return merged
+
+
 def apply_finger_joints_fusion(
     projections: dict[int, Projection2D],
     shared_edges: list[SharedEdge],
@@ -990,7 +1056,13 @@ def apply_finger_joints_fusion(
     for fid, proj in projections.items():
         exclusion_zones[fid] = _build_exclusion_zones(proj, notch_buffer)
 
-    # Direct shared-edge joints
+    # Collect edge operations first, then apply once per face. This keeps
+    # edge contracts deterministic and avoids sequential edge-order drift.
+    add_ops: dict[int, list[Polygon]] = {fid: [] for fid in projections}
+    sub_ops: dict[int, list[Polygon]] = {fid: [] for fid in projections}
+
+    # Direct shared-edge joints: compute intervals once on the owner side and
+    # map them to the mate edge, instead of recomputing independently.
     for se in shared_edges:
         fid_a = se.face_a_id
         fid_b = se.face_b_id
@@ -1036,16 +1108,12 @@ def apply_finger_joints_fusion(
         if pos_plateaus and neg_plateaus:
             neg_in_pos = _reverse_segments(neg_plateaus) if reversed_edge else neg_plateaus
             shared_pos = _intersect_segment_lists(pos_plateaus, neg_in_pos)
-            shared_neg = _reverse_segments(shared_pos) if reversed_edge else shared_pos
         elif pos_plateaus:
             shared_pos = pos_plateaus
-            shared_neg = _reverse_segments(pos_plateaus) if reversed_edge else pos_plateaus
         elif neg_plateaus:
-            shared_neg = neg_plateaus
             shared_pos = _reverse_segments(neg_plateaus) if reversed_edge else neg_plateaus
         else:
             shared_pos = []
-            shared_neg = []
 
         # Keep mating faces in lock-step: shared margins are computed in the
         # positive face's parametric direction and mapped to the negative side.
@@ -1058,14 +1126,7 @@ def apply_finger_joints_fusion(
         shared_start_margin = max(edge_margin, pos_start_keepout, neg_start_in_pos)
         shared_end_margin = max(edge_margin, pos_end_keepout, neg_end_in_pos)
 
-        if reversed_edge:
-            neg_start_margin = shared_end_margin
-            neg_end_margin = shared_start_margin
-        else:
-            neg_start_margin = shared_start_margin
-            neg_end_margin = shared_end_margin
-
-        pos_intervals = _build_fusion_intervals_for_segments(
+        owner_intervals = _build_fusion_intervals_for_segments(
             pos_len,
             fusion_params,
             segments_t=shared_pos,
@@ -1074,22 +1135,18 @@ def apply_finger_joints_fusion(
             end_margin=shared_end_margin,
             min_segment_length=min_plateau_length,
         )
-        neg_intervals = _build_fusion_intervals_for_segments(
-            neg_len,
-            fusion_params,
-            segments_t=shared_neg,
-            margin=edge_margin,
-            start_margin=neg_start_margin,
-            end_margin=neg_end_margin,
-            min_segment_length=min_plateau_length,
-        )
-        if pos_intervals is None or neg_intervals is None:
+        if owner_intervals is None:
             continue
-        pos_finger_intervals, _ = pos_intervals
-        _, neg_slot_intervals = neg_intervals
+        pos_finger_intervals, owner_slot_intervals = owner_intervals
+        neg_slot_intervals = _map_intervals_by_param(
+            pos_len,
+            neg_len,
+            owner_slot_intervals,
+            reverse=reversed_edge,
+        )
 
         # Positive face geometry: tabs outward (legacy) or notches inward.
-        outward_pos = _outward_direction(pos_p1, pos_p2, shapes[pos_id])
+        outward_pos = _outward_direction(pos_p1, pos_p2, raw_shapes[pos_id])
         if tab_direction == TAB_DIRECTION_INWARD:
             inward_pos = (-outward_pos[0], -outward_pos[1])
             # Build inward notches from local fusion segments so margins stay
@@ -1107,26 +1164,23 @@ def apply_finger_joints_fusion(
                 pos_p1, pos_p2, pos_depth, inward_pos, pos_notch_intervals,
                 exclusion_zones=exclusion_zones.get(pos_id, []),
             )
-            if pos_notches:
-                shapes[pos_id] = shapes[pos_id].difference(unary_union(pos_notches))
+            sub_ops[pos_id].extend(pos_notches)
         else:
             pos_teeth = _make_comb_from_intervals(
                 pos_p1, pos_p2, pos_depth, outward_pos, pos_finger_intervals,
                 exclusion_zones=exclusion_zones.get(pos_id, []),
             )
-            if pos_teeth:
-                shapes[pos_id] = shapes[pos_id].union(unary_union(pos_teeth))
+            add_ops[pos_id].extend(pos_teeth)
 
         # Mating slots on negative face
         if neg_depth > 1e-9:
-            outward_neg = _outward_direction(neg_p1, neg_p2, shapes[neg_id])
+            outward_neg = _outward_direction(neg_p1, neg_p2, raw_shapes[neg_id])
             inward_neg = (-outward_neg[0], -outward_neg[1])
             neg_teeth = _make_comb_from_intervals(
                 neg_p1, neg_p2, neg_depth, inward_neg, neg_slot_intervals,
                 exclusion_zones=exclusion_zones.get(neg_id, []),
             )
-            if neg_teeth:
-                shapes[neg_id] = shapes[neg_id].difference(unary_union(neg_teeth))
+            sub_ops[neg_id].extend(neg_teeth)
 
     # Through-slot joints for walls not directly adjacent to bottom
     if faces is not None:
@@ -1208,15 +1262,8 @@ def apply_finger_joints_fusion(
                 shared_start_margin = max(edge_margin, wall_start_keepout, bottom_start_keepout)
                 shared_end_margin = max(edge_margin, wall_end_keepout, bottom_end_keepout)
 
-                bottom_intervals = _build_fusion_intervals_for_segments(
-                    slot_len,
-                    fusion_params,
-                    segments_t=shared_plateaus,
-                    margin=edge_margin,
-                    start_margin=shared_start_margin,
-                    end_margin=shared_end_margin,
-                    min_segment_length=min_plateau_length,
-                )
+                # Owner contract is the wall edge; bottom slots are mapped from
+                # owner intervals to keep both sides in lock-step.
                 wall_intervals = _build_fusion_intervals_for_segments(
                     wall_len,
                     fusion_params,
@@ -1226,25 +1273,29 @@ def apply_finger_joints_fusion(
                     end_margin=shared_end_margin,
                     min_segment_length=min_plateau_length,
                 )
-                if bottom_intervals is None or wall_intervals is None:
+                if wall_intervals is None:
                     continue
-                _, slot_intervals = bottom_intervals
-                finger_intervals, _ = wall_intervals
+                finger_intervals, wall_slot_intervals = wall_intervals
+                slot_intervals = _map_intervals_by_param(
+                    wall_len,
+                    slot_len,
+                    wall_slot_intervals,
+                    reverse=False,
+                )
 
                 # Slots on bottom plate
-                outward_bottom = _outward_direction(slot_start, slot_end, shapes[bottom_id])
+                outward_bottom = _outward_direction(slot_start, slot_end, raw_shapes[bottom_id])
                 inward_bottom = (-outward_bottom[0], -outward_bottom[1])
                 bottom_slots = _make_comb_from_intervals(
                     slot_start, slot_end, slot_depth, inward_bottom, slot_intervals,
                     exclusion_zones=exclusion_zones.get(bottom_id, []),
                 )
-                if bottom_slots:
-                    shapes[bottom_id] = shapes[bottom_id].difference(unary_union(bottom_slots))
+                sub_ops[bottom_id].extend(bottom_slots)
 
                 # Wall geometry: tabs outward (legacy) or notches inward.
                 if tab_depth <= 1e-9:
                     continue
-                outward_wall = _outward_direction(wall_start, wall_end, shapes[fid])
+                outward_wall = _outward_direction(wall_start, wall_end, raw_shapes[fid])
                 if tab_direction == TAB_DIRECTION_INWARD:
                     inward_wall = (-outward_wall[0], -outward_wall[1])
                     # Through-slot walls need full complement notches so the
@@ -1263,19 +1314,31 @@ def apply_finger_joints_fusion(
                         wall_start, wall_end, tab_depth, inward_wall, wall_notch_intervals,
                         exclusion_zones=exclusion_zones.get(fid, []),
                     )
-                    if wall_notches:
-                        shapes[fid] = shapes[fid].difference(unary_union(wall_notches))
+                    sub_ops[fid].extend(wall_notches)
                 else:
                     wall_tabs = _make_comb_from_intervals(
                         wall_start, wall_end, tab_depth, outward_wall, finger_intervals,
                         exclusion_zones=exclusion_zones.get(fid, []),
                     )
-                    if wall_tabs:
-                        shapes[fid] = shapes[fid].union(unary_union(wall_tabs))
+                    add_ops[fid].extend(wall_tabs)
+
+    # Apply accumulated operations once per face.
+    final_shapes: dict[int, Polygon] = {}
+    for fid, base in shapes.items():
+        shape = base
+        if add_ops[fid]:
+            add_union = unary_union(add_ops[fid])
+            if not add_union.is_empty:
+                shape = shape.union(add_union)
+        if sub_ops[fid]:
+            sub_union = unary_union(sub_ops[fid])
+            if not sub_union.is_empty:
+                shape = shape.difference(sub_union)
+        final_shapes[fid] = shape
 
     modified: dict[int, list[tuple[float, float]]] = {}
     slot_cutouts: dict[int, list[list[tuple[float, float]]]] = {}
-    for fid, shape in shapes.items():
+    for fid, shape in final_shapes.items():
         outer, inners = _shapely_to_vertices(shape)
         modified[fid] = outer
         slot_cutouts[fid] = inners
