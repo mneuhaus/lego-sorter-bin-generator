@@ -911,3 +911,243 @@ def export_svg(
 
     dwg.save()
     return output_path
+
+
+def _shift_points(points: list[tuple[float, float]], dx: float, dy: float) -> list[tuple[float, float]]:
+    return [(x + dx, y + dy) for x, y in points]
+
+
+def _build_overlay_panel(
+    part_a: dict,
+    part_b: dict,
+    a_edge: tuple[tuple[float, float], tuple[float, float]],
+    b_edge: tuple[tuple[float, float], tuple[float, float]],
+    label: str,
+) -> dict | None:
+    """Build one overlap-debug panel by aligning B's edge onto A's edge."""
+    ap1_local = _pt_to_local(part_a, a_edge[0])
+    ap2_local = _pt_to_local(part_a, a_edge[1])
+    bp1_local = _pt_to_local(part_b, b_edge[0])
+    bp2_local = _pt_to_local(part_b, b_edge[1])
+
+    a_poly = list(part_a["polygon"])
+    a_holes = [list(h) for h in part_a["holes"]]
+
+    b_poly = _transform_points_to_edge(part_b["polygon"], bp1_local, bp2_local, ap1_local, ap2_local)
+    b_holes = [_transform_points_to_edge(h, bp1_local, bp2_local, ap1_local, ap2_local) for h in part_b["holes"]]
+
+    # Mirror B across the shared edge if needed so both face interiors are on
+    # the same side, making mismatch regions visually obvious via alpha overlap.
+    def _side(pt: tuple[float, float], p1: tuple[float, float], p2: tuple[float, float]) -> float:
+        return _triangle_area2(p1, p2, pt)
+
+    a_side = _side(_centroid(a_poly), ap1_local, ap2_local)
+    b_side = _side(_centroid(b_poly), ap1_local, ap2_local)
+    if a_side * b_side < 0:
+        b_poly = _reflect_points_across_line(b_poly, ap1_local, ap2_local)
+        b_holes = [_reflect_points_across_line(h, ap1_local, ap2_local) for h in b_holes]
+
+    xs = [p[0] for p in a_poly] + [p[0] for p in b_poly]
+    ys = [p[1] for p in a_poly] + [p[1] for p in b_poly]
+    if not xs or not ys:
+        return None
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    return {
+        "label": label,
+        "a_poly": a_poly,
+        "a_holes": a_holes,
+        "b_poly": b_poly,
+        "b_holes": b_holes,
+        "edge": (ap1_local, ap2_local),
+        "min_x": min_x,
+        "min_y": min_y,
+        "width": max_x - min_x,
+        "height": max_y - min_y,
+    }
+
+
+def export_svg_overlap_debug(
+    projections: dict[int, Projection2D],
+    modified_polygons: dict[int, list[tuple[float, float]]],
+    output_path: str,
+    slot_cutouts: dict[int, list[list[tuple[float, float]]]] | None = None,
+    shared_edges: list[SharedEdge] | None = None,
+    bottom_id: int | None = None,
+    faces: list[PlanarFace] | None = None,
+    panel_padding: float = 8.0,
+    panel_gap: float = 12.0,
+) -> str:
+    """Export per-joint translucent overlap panels for visual mesh verification."""
+    import os
+
+    if not output_path.endswith(".svg"):
+        os.makedirs(output_path, exist_ok=True)
+        output_path = os.path.join(output_path, "lasercut-verify-overlap.svg")
+    else:
+        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    parts = _prepare_parts(projections, modified_polygons, slot_cutouts)
+    part_by_fid = {p["fid"]: p for p in parts}
+    panels: list[dict] = []
+    direct_pair_keys: set[tuple[int, int]] = set()
+
+    if shared_edges is not None:
+        for i, se in enumerate(shared_edges):
+            fid_a = se.face_a_id
+            fid_b = se.face_b_id
+            if fid_a not in projections or fid_b not in projections:
+                continue
+            part_a = part_by_fid.get(fid_a)
+            part_b = part_by_fid.get(fid_b)
+            if part_a is None or part_b is None:
+                continue
+
+            edge_idx_a = _find_matching_edge_index(projections[fid_a], se)
+            edge_idx_b = _find_matching_edge_index(projections[fid_b], se)
+            if edge_idx_a is None or edge_idx_b is None:
+                continue
+
+            a_edge = projections[fid_a].outer_edges_2d[edge_idx_a]
+            b_edge = projections[fid_b].outer_edges_2d[edge_idx_b]
+            panel = _build_overlay_panel(
+                part_a,
+                part_b,
+                a_edge,
+                b_edge,
+                label=f"shared-{i}: {part_a['label']} vs {part_b['label']}",
+            )
+            if panel is not None:
+                panels.append(panel)
+                direct_pair_keys.add(tuple(sorted((fid_a, fid_b))))
+
+    # Add through-slot bottom-wall overlays (including extra wall instances).
+    if bottom_id is not None and faces is not None and shared_edges is not None and bottom_id in part_by_fid:
+        anchors = _build_bottom_anchors(
+            projections=projections,
+            shared_edges=shared_edges,
+            bottom_id=bottom_id,
+            faces=faces,
+        )
+        bottom_part = part_by_fid[bottom_id]
+        for wall_id, anchor in anchors.items():
+            wall_part = part_by_fid.get(wall_id)
+            if wall_part is None:
+                continue
+            pair_key = tuple(sorted((bottom_id, wall_id)))
+            if pair_key in direct_pair_keys:
+                continue
+
+            bp1, bp2 = anchor["bottom_edge"]
+            wp1, wp2 = anchor["wall_edge"]
+            if anchor.get("reversed"):
+                wp1, wp2 = wp2, wp1
+            panel = _build_overlay_panel(
+                bottom_part,
+                wall_part,
+                (bp1, bp2),
+                (wp1, wp2),
+                label=f"through: {bottom_part['label']} vs {wall_part['label']}",
+            )
+            if panel is not None:
+                panels.append(panel)
+
+    if not panels:
+        dwg = svgwrite.Drawing(
+            output_path,
+            size=("200mm", "60mm"),
+            viewBox="0 0 200 60",
+        )
+        dwg.add(dwg.text("No overlap panels found", insert=(8, 24), fill="black", font_size="8px"))
+        dwg.save()
+        return output_path
+
+    cursor_y = panel_padding
+    max_panel_w = 0.0
+    for panel in panels:
+        dx = panel_padding - panel["min_x"]
+        dy = cursor_y - panel["min_y"]
+        panel["a_poly"] = _shift_points(panel["a_poly"], dx, dy)
+        panel["a_holes"] = [_shift_points(h, dx, dy) for h in panel["a_holes"]]
+        panel["b_poly"] = _shift_points(panel["b_poly"], dx, dy)
+        panel["b_holes"] = [_shift_points(h, dx, dy) for h in panel["b_holes"]]
+        panel["edge"] = (
+            (panel["edge"][0][0] + dx, panel["edge"][0][1] + dy),
+            (panel["edge"][1][0] + dx, panel["edge"][1][1] + dy),
+        )
+        cursor_y += panel["height"] + panel_gap
+        max_panel_w = max(max_panel_w, panel["width"])
+
+    canvas_w = max_panel_w + 2 * panel_padding
+    canvas_h = cursor_y - panel_gap + panel_padding
+    dwg = svgwrite.Drawing(
+        output_path,
+        size=(f"{canvas_w:.1f}mm", f"{canvas_h:.1f}mm"),
+        viewBox=f"0 0 {canvas_w:.1f} {canvas_h:.1f}",
+    )
+
+    for panel in panels:
+        group = dwg.g(id=panel["label"].replace(" ", "_"))
+        group.add(
+            dwg.polygon(
+                panel["a_poly"],
+                fill="#1f77b4",
+                fill_opacity=0.5,
+                stroke="#1f77b4",
+                stroke_width=0.35,
+            )
+        )
+        for hole in panel["a_holes"]:
+            group.add(
+                dwg.polygon(
+                    hole,
+                    fill="white",
+                    fill_opacity=1.0,
+                    stroke="#1f77b4",
+                    stroke_width=0.25,
+                )
+            )
+
+        group.add(
+            dwg.polygon(
+                panel["b_poly"],
+                fill="#d62728",
+                fill_opacity=0.5,
+                stroke="#d62728",
+                stroke_width=0.35,
+            )
+        )
+        for hole in panel["b_holes"]:
+            group.add(
+                dwg.polygon(
+                    hole,
+                    fill="white",
+                    fill_opacity=1.0,
+                    stroke="#d62728",
+                    stroke_width=0.25,
+                )
+            )
+
+        group.add(
+            dwg.line(
+                start=panel["edge"][0],
+                end=panel["edge"][1],
+                stroke="black",
+                stroke_width=0.45,
+                stroke_dasharray="1,1",
+            )
+        )
+        text_pos = (panel["edge"][0][0] + 2.0, min(panel["edge"][0][1], panel["edge"][1][1]) - 1.5)
+        group.add(
+            dwg.text(
+                panel["label"],
+                insert=text_pos,
+                fill="black",
+                font_size="4px",
+            )
+        )
+        dwg.add(group)
+
+    dwg.save()
+    return output_path

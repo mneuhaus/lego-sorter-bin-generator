@@ -66,6 +66,14 @@ def main():
         help="Draw original projected face geometry in green on SVG for dimension debugging",
     )
     parser.add_argument(
+        "--svg-verify-overlap",
+        action="store_true",
+        help=(
+            "Write additional translucent overlap SVG panels for per-joint mesh verification "
+            "(lasercut-verify-overlap.svg)"
+        ),
+    )
+    parser.add_argument(
         "--fusion-placement",
         choices=[
             FUSION_PLACEMENT_FINGERS_OUTSIDE,
@@ -138,7 +146,7 @@ def main():
         FusionJointParams,
         apply_finger_joints_fusion,
     )
-    from .exporter import export_dxf, export_svg
+    from .exporter import export_dxf, export_svg, export_svg_overlap_debug
 
     # Step 1: Load STEP and extract planar faces
     print(f"Loading STEP file: {args.input}")
@@ -212,6 +220,8 @@ def main():
     print(f"  Tab direction: {args.tab_direction}")
     if args.svg_overlay_original:
         print("  SVG original overlay: enabled")
+    if args.svg_verify_overlap:
+        print("  SVG overlap verifier: enabled")
     print(f"  Placement: {args.fusion_placement}")
     print(f"  Size mode: {args.fusion_size_mode}")
     print(f"  Count mode: {args.fusion_count_mode}")
@@ -292,6 +302,20 @@ def main():
                               overlay_original=args.svg_overlay_original)
         written.append(svg_file)
         print(f"  Written: {svg_file}")
+
+        if args.svg_verify_overlap:
+            verify_path = os.path.join(args.output, "lasercut-verify-overlap.svg")
+            verify_file = export_svg_overlap_debug(
+                projections,
+                modified_polygons,
+                verify_path,
+                slot_cutouts=slot_cutouts,
+                shared_edges=relevant_shared,
+                bottom_id=bottom.face_id,
+                faces=faces,
+            )
+            written.append(verify_file)
+            print(f"  Written: {verify_file}")
 
     print(f"\nDone! {len(written)} file(s) written to {args.output}/")
 
