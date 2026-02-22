@@ -59,12 +59,6 @@ def main():
         default=TAB_DIRECTION_INWARD,
         help=f"Positive tab style: {TAB_DIRECTION_OUTWARD} (legacy) or {TAB_DIRECTION_INWARD}",
     )
-    parser.add_argument(
-        "--joint-engine",
-        choices=["cadquery", "shapely"],
-        default="cadquery",
-        help="Geometry boolean backend for joint application (default: cadquery)",
-    )
     parser.add_argument("--wall-offset", type=float, default=DEFAULT_FOLDED_OFFSET,
                         help=f"Gap from bottom plate to surrounding walls in folded layout (default: {DEFAULT_FOLDED_OFFSET}mm)")
     parser.add_argument(
@@ -201,7 +195,6 @@ def main():
         FusionJointParams,
         apply_finger_joints_fusion,
     )
-    from .finger_joints_cadquery import apply_finger_joints_fusion_cadquery
     from .overlap_diff import create_overlap_diff_heatmap
     from .exporter import export_dxf, export_svg, export_svg_overlap_debug
 
@@ -275,7 +268,6 @@ def main():
     print(f"  Min plateau length: {mpl_display} mm")
     print(f"  Layout: {args.layout}")
     print(f"  Tab direction: {args.tab_direction}")
-    print(f"  Joint engine: {args.joint_engine}")
     if args.svg_overlay_original:
         print("  SVG original overlay: enabled")
     if args.svg_verify_overlap:
@@ -304,36 +296,20 @@ def main():
         min_notch_size=args.fusion_min_notch_size,
         gap=args.fusion_gap,
     )
-    if args.joint_engine == "cadquery":
-        modified_polygons, slot_cutouts = apply_finger_joints_fusion_cadquery(
-            projections,
-            relevant_shared,
-            bottom_id=bottom.face_id,
-            thickness=args.thickness,
-            kerf=args.kerf,
-            edge_margin=args.edge_margin,
-            notch_buffer=args.notch_buffer,
-            plateau_inset=args.plateau_inset,
-            min_plateau_length=args.min_plateau_length,
-            tab_direction=args.tab_direction,
-            faces=faces,
-            fusion_params=fusion_params,
-        )
-    else:
-        modified_polygons, slot_cutouts = apply_finger_joints_fusion(
-            projections,
-            relevant_shared,
-            bottom_id=bottom.face_id,
-            thickness=args.thickness,
-            kerf=args.kerf,
-            edge_margin=args.edge_margin,
-            notch_buffer=args.notch_buffer,
-            plateau_inset=args.plateau_inset,
-            min_plateau_length=args.min_plateau_length,
-            tab_direction=args.tab_direction,
-            faces=faces,
-            fusion_params=fusion_params,
-        )
+    modified_polygons, slot_cutouts = apply_finger_joints_fusion(
+        projections,
+        relevant_shared,
+        bottom_id=bottom.face_id,
+        thickness=args.thickness,
+        kerf=args.kerf,
+        edge_margin=args.edge_margin,
+        notch_buffer=args.notch_buffer,
+        plateau_inset=args.plateau_inset,
+        min_plateau_length=args.min_plateau_length,
+        tab_direction=args.tab_direction,
+        faces=faces,
+        fusion_params=fusion_params,
+    )
 
     # Report through-slots
     for fid, slots in slot_cutouts.items():
