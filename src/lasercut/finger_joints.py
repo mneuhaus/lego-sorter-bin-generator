@@ -1149,16 +1149,15 @@ def apply_finger_joints_fusion(
         outward_pos = _outward_direction(pos_p1, pos_p2, raw_shapes[pos_id])
         if tab_direction == TAB_DIRECTION_INWARD:
             inward_pos = (-outward_pos[0], -outward_pos[1])
-            # Build inward notches from local fusion segments so margins stay
-            # flat (no tiny end notches) and segment boundaries are respected.
-            pos_notch_intervals = _build_inward_notch_intervals_for_segments(
+            # Derive inward notches from the same owner slot contract that
+            # drives mate cutouts, then clip terminal margins to avoid corner
+            # endpoint artifacts.
+            pos_notch_intervals = _complement_notch_intervals(pos_len, owner_slot_intervals)
+            pos_notch_intervals = _clip_intervals_to_terminal_margins(
                 pos_len,
-                fusion_params,
-                segments_t=shared_pos,
-                margin=edge_margin,
+                pos_notch_intervals,
                 start_margin=shared_start_margin,
                 end_margin=shared_end_margin,
-                min_segment_length=min_plateau_length,
             )
             pos_notches = _make_comb_from_intervals(
                 pos_p1, pos_p2, pos_depth, inward_pos, pos_notch_intervals,
@@ -1298,12 +1297,10 @@ def apply_finger_joints_fusion(
                 outward_wall = _outward_direction(wall_start, wall_end, raw_shapes[fid])
                 if tab_direction == TAB_DIRECTION_INWARD:
                     inward_wall = (-outward_wall[0], -outward_wall[1])
-                    # Through-slot walls need full complement notches so the
-                    # remaining edge spans act as actual through-tabs that mate
-                    # with bottom slots (including single-finger cases).
-                    wall_notch_intervals = _complement_notch_intervals(wall_len, finger_intervals)
-                    # Keep corner-safe terminal margins clear so through-slot
-                    # notches do not distort adjacent wall-wall edge features.
+                    # Use slot-based complement for through walls as well so
+                    # both sides stay in lock-step; clip terminal margins for
+                    # corner safety.
+                    wall_notch_intervals = _complement_notch_intervals(wall_len, wall_slot_intervals)
                     wall_notch_intervals = _clip_intervals_to_terminal_margins(
                         wall_len,
                         wall_notch_intervals,
