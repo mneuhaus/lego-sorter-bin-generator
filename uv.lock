@@ -254,6 +254,11 @@ wheels = [
 ]
 
 [[package]]
+name = "cq-warehouse"
+version = "0.8.0"
+source = { git = "https://github.com/gumyr/cq_warehouse.git#daa46507ecc429c0e2dce11d9d5ffd09b12a42af" }
+
+[[package]]
 name = "cycler"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -510,6 +515,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cadquery" },
+    { name = "cq-warehouse" },
     { name = "shapely" },
     { name = "svgwrite" },
 ]
@@ -517,6 +523,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cadquery", specifier = ">=2.4.0" },
+    { name = "cq-warehouse", git = "https://github.com/gumyr/cq_warehouse.git" },
     { name = "shapely", specifier = ">=2.0" },
     { name = "svgwrite", specifier = ">=1.4" },
 ]

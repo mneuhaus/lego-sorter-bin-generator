@@ -7,6 +7,8 @@ Supports two joint types:
 
 from __future__ import annotations
 
+import math
+
 import cadquery as cq
 from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
@@ -15,6 +17,9 @@ from lasercut.panels import (
     BinModel,
     Panel,
     SharedEdge,
+    _extract_outer_wire_edges,
+    _thicken_face_inward,
+    _edge_overlap_length,
     _vec_sub,
     _vec_len,
     _vec_cross,
@@ -119,6 +124,293 @@ def _to_cuttable(obj) -> cq.Shape:
     if isinstance(wrapped, TopoDS_Compound):
         return cq.Compound(wrapped)
     return cq.Shape(wrapped)
+
+
+def _clone_panels(panels: dict[str, Panel]) -> dict[str, Panel]:
+    """Clone panel metadata while keeping underlying CQ shapes."""
+    cloned: dict[str, Panel] = {}
+    for name, p in panels.items():
+        cloned[name] = Panel(
+            name=p.name,
+            solid=p.solid,
+            outer_normal=p.outer_normal,
+            width=p.width,
+            height=p.height,
+            outer_face=p.outer_face,
+            outer_edges=list(p.outer_edges),
+        )
+    return cloned
+
+
+def _edge_endpoints(edge: cq.Edge) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Return edge endpoints as tuples."""
+    verts = edge.Vertices()
+    if len(verts) >= 2:
+        p0 = verts[0].toVector()
+        p1 = verts[1].toVector()
+        return ((p0.x, p0.y, p0.z), (p1.x, p1.y, p1.z))
+
+    p0 = edge.positionAt(0)
+    p1 = edge.positionAt(1)
+    return ((p0.x, p0.y, p0.z), (p1.x, p1.y, p1.z))
+
+
+def _match_source_edges_for_shared_edges(
+    source_solid: cq.Shape,
+    shared_edges: list[SharedEdge],
+    line_tolerance: float = 1.5,
+) -> list[cq.Edge]:
+    """Match extracted shared-edge segments to line edges in the source solid."""
+    source_edges = [e for e in source_solid.Edges() if e.geomType() == "LINE"]
+    matched: list[cq.Edge] = []
+    used: set[int] = set()
+
+    for se in shared_edges:
+        se_vec = _vec_sub(se.end_3d, se.start_3d)
+        se_len = _vec_len(se_vec)
+        if se_len < 1e-6:
+            continue
+        se_dir = _normalize(se_vec)
+
+        best_idx: int | None = None
+        best_overlap = 0.0
+        for idx, edge in enumerate(source_edges):
+            if idx in used:
+                continue
+            p0, p1 = _edge_endpoints(edge)
+            edge_vec = _vec_sub(p1, p0)
+            edge_len = _vec_len(edge_vec)
+            if edge_len < 1e-6:
+                continue
+            edge_dir = _normalize(edge_vec)
+            if abs(_vec_dot(se_dir, edge_dir)) < 0.97:
+                continue
+
+            d0 = _point_to_line_dist(p0, se.start_3d, se.end_3d)
+            d1 = _point_to_line_dist(p1, se.start_3d, se.end_3d)
+            if d0 > line_tolerance and d1 > line_tolerance:
+                continue
+
+            overlap = _edge_overlap_length(se.start_3d, se.end_3d, p0, p1)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_idx = idx
+
+        if best_idx is None:
+            continue
+
+        min_overlap = max(5.0, se.edge_length * 0.35)
+        if best_overlap < min_overlap:
+            continue
+
+        matched.append(source_edges[best_idx])
+        used.add(best_idx)
+
+    return matched
+
+
+def _make_finger_joint_faces_safe(
+    shape: cq.Shape,
+    finger_joint_edges: list[cq.Edge],
+    material_thickness: float,
+    target_finger_width: float,
+    kerf_width: float = 0.0,
+) -> list[cq.Face]:
+    """cq_warehouse-style finger-joint face generation for selected seam edges.
+
+    Mirrors cq_warehouse logic but supports partial edge selections safely.
+    """
+    working_faces = shape.Faces()
+    working_face_areas = [f.Area() for f in working_faces]
+
+    edge_adjacency: dict[cq.Edge, list[int]] = {}
+    edge_vertex_adjacency: dict[cq.Vertex, set[int]] = {}
+    filtered_edges: list[cq.Edge] = []
+
+    for common_edge in finger_joint_edges:
+        if common_edge.Length() < max(0.5, target_finger_width * 0.5):
+            continue
+        adjacent_face_indices = [
+            i for i, face in enumerate(working_faces) if common_edge in face.Edges()
+        ]
+        if len(adjacent_face_indices) != 2:
+            continue
+
+        filtered_edges.append(common_edge)
+        edge_adjacency[common_edge] = adjacent_face_indices
+        for v in common_edge.Vertices():
+            if v in edge_vertex_adjacency:
+                edge_vertex_adjacency[v].update(adjacent_face_indices)
+            else:
+                edge_vertex_adjacency[v] = set(adjacent_face_indices)
+
+    if not edge_adjacency:
+        raise RuntimeError("No valid seam edges for cq_warehouse face jointing")
+
+    finger_depths: dict[cq.Edge, float] = {}
+    external_corners: dict[cq.Edge, bool] = {}
+    for common_edge, adjacent_face_indices in edge_adjacency.items():
+        face_centers = [working_faces[i].Center() for i in adjacent_face_indices]
+        face_normals = [
+            working_faces[i].normalAt(working_faces[i].Center())
+            for i in adjacent_face_indices
+        ]
+        ref_plane = cq.Plane(origin=face_centers[0], normal=face_normals[0])
+        localized_opposite_center = ref_plane.toLocalCoords(face_centers[1])
+        external_corners[common_edge] = localized_opposite_center.z < 0
+
+        corner_angle = abs(
+            face_normals[0].getSignedAngle(face_normals[1], common_edge.tangentAt(0))
+        )
+        finger_depths[common_edge] = material_thickness * max(
+            math.sin(corner_angle),
+            (
+                math.sin(corner_angle)
+                + (math.cos(corner_angle) - 1) * math.tan(math.pi / 2 - corner_angle)
+            ),
+        )
+
+    vertices_with_internal_edge: dict[cq.Vertex, bool] = {}
+    for e in filtered_edges:
+        for v in e.Vertices():
+            if v in vertices_with_internal_edge:
+                vertices_with_internal_edge[v] = (
+                    vertices_with_internal_edge[v] or not external_corners[e]
+                )
+            else:
+                vertices_with_internal_edge[v] = not external_corners[e]
+
+    # Faces may include vertices not present in selected seam edges.
+    open_internal_vertices: dict[cq.Vertex, set[int]] = {}
+    for i, face in enumerate(working_faces):
+        for v in face.Vertices():
+            if vertices_with_internal_edge.get(v, False):
+                if i not in edge_vertex_adjacency.get(v, set()):
+                    if v in open_internal_vertices:
+                        open_internal_vertices[v].add(i)
+                    else:
+                        open_internal_vertices[v] = {i}
+
+    corner_face_counter: dict[cq.Vertex, set[int]] = {}
+    for common_edge, adjacent_face_indices in edge_adjacency.items():
+        primary_face_index = adjacent_face_indices[0]
+        secondary_face_index = adjacent_face_indices[1]
+        if working_face_areas[primary_face_index] > working_face_areas[secondary_face_index]:
+            primary_face_index, secondary_face_index = secondary_face_index, primary_face_index
+
+        for i in [primary_face_index, secondary_face_index]:
+            working_faces[i] = working_faces[i].makeFingerJoints(
+                common_edge,
+                finger_depths[common_edge],
+                target_finger_width,
+                corner_face_counter,
+                open_internal_vertices,
+                alignToBottom=i == primary_face_index,
+                externalCorner=external_corners[common_edge],
+                faceIndex=i,
+            )
+
+    tabbed_face_indices = set(i for face_list in edge_adjacency.values() for i in face_list)
+    tabbed_faces = [working_faces[i] for i in tabbed_face_indices]
+
+    if kerf_width != 0.0:
+        tabbed_faces = [
+            cq.Face.makeFromWires(
+                f.outerWire().offset2D(kerf_width / 2)[0],
+                [i.offset2D(-kerf_width / 2)[0] for i in f.innerWires()],
+            )
+            for f in tabbed_faces
+        ]
+
+    return tabbed_faces
+
+
+def _apply_finger_joints_cqwarehouse(
+    model: BinModel,
+    finger_width: float,
+) -> BinModel:
+    """Use cq_warehouse topology-aware finger joints when source solid is available."""
+    if model.source_solid is None:
+        raise ValueError("No source_solid available for cq_warehouse processing")
+
+    try:
+        import cq_warehouse.extensions  # noqa: F401
+    except ImportError as exc:
+        raise RuntimeError("cq_warehouse is not installed") from exc
+
+    source_solid = _to_cuttable(model.source_solid)
+    joint_edges = _match_source_edges_for_shared_edges(source_solid, model.shared_edges)
+    if not joint_edges:
+        raise RuntimeError("No source edges matched shared seams for cq_warehouse")
+
+    jointed_faces = _make_finger_joint_faces_safe(
+        source_solid,
+        joint_edges,
+        material_thickness=model.thickness,
+        target_finger_width=finger_width,
+        kerf_width=0.0,
+    )
+    if not jointed_faces:
+        raise RuntimeError("cq_warehouse returned no jointed faces")
+
+    panels = _clone_panels(model.panels)
+
+    panel_reference: list[tuple[str, Panel, tuple[float, float, float]]] = []
+    for name, panel in panels.items():
+        if panel.outer_face is None:
+            continue
+        c = panel.outer_face.Center()
+        panel_reference.append((name, panel, (c.x, c.y, c.z)))
+
+    matched_names: set[str] = set()
+    for face in jointed_faces:
+        fc = face.Center()
+        fn = face.normalAt(fc)
+        fn_t = (fn.x, fn.y, fn.z)
+        face_center = (fc.x, fc.y, fc.z)
+
+        best_name: str | None = None
+        best_score = float("-inf")
+        for name, panel, ref_center in panel_reference:
+            if name in matched_names:
+                continue
+
+            normal_dot = _vec_dot(fn_t, panel.outer_normal)
+            if normal_dot < 0.85:
+                continue
+            center_dist = _pt_dist(face_center, ref_center)
+            score = normal_dot * 1000.0 - center_dist
+            if score > best_score:
+                best_score = score
+                best_name = name
+
+        if best_name is None:
+            continue
+
+        base_panel = panels[best_name]
+        new_edges = _extract_outer_wire_edges(face)
+        new_solid = _thicken_face_inward(face, base_panel.outer_normal, model.thickness)
+        panels[best_name] = Panel(
+            name=base_panel.name,
+            solid=new_solid,
+            outer_normal=base_panel.outer_normal,
+            width=base_panel.width,
+            height=base_panel.height,
+            outer_face=face,
+            outer_edges=new_edges,
+        )
+        matched_names.add(best_name)
+
+    if not matched_names:
+        raise RuntimeError("cq_warehouse faces could not be matched back to panels")
+
+    print(f"  cq_warehouse: jointed {len(matched_names)} panels from {len(joint_edges)} edges")
+    return BinModel(
+        panels=panels,
+        shared_edges=model.shared_edges,
+        thickness=model.thickness,
+        source_solid=model.source_solid,
+    )
 
 
 def _make_oriented_box(
@@ -446,19 +738,15 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
 
     Returns a new BinModel with modified panel solids.
     """
-    thickness = model.thickness
+    # Prefer topology-aware jointing from cq_warehouse when a source solid exists.
+    if model.source_solid is not None:
+        try:
+            return _apply_finger_joints_cqwarehouse(model, finger_width)
+        except Exception as exc:
+            print(f"  cq_warehouse fallback to custom joints ({exc})")
 
-    # Copy panels so we can modify solids
-    panels = {}
-    for name, p in model.panels.items():
-        panels[name] = Panel(
-            name=p.name,
-            solid=p.solid,
-            outer_normal=p.outer_normal,
-            width=p.width,
-            height=p.height,
-            outer_edges=list(p.outer_edges),
-        )
+    thickness = model.thickness
+    panels = _clone_panels(model.panels)
 
     corners = _find_corner_points(model.shared_edges)
 
@@ -548,4 +836,9 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
         pa.solid = solid_a
         pb.solid = solid_b
 
-    return BinModel(panels=panels, shared_edges=model.shared_edges, thickness=thickness)
+    return BinModel(
+        panels=panels,
+        shared_edges=model.shared_edges,
+        thickness=thickness,
+        source_solid=model.source_solid,
+    )

@@ -26,6 +26,7 @@ class Panel:
     outer_normal: tuple[float, float, float]
     width: float   # longer in-plane dimension
     height: float  # shorter in-plane dimension
+    outer_face: cq.Face | None = None
     outer_edges: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = field(
         default_factory=list
     )
@@ -45,6 +46,7 @@ class BinModel:
     panels: dict[str, Panel]
     shared_edges: list[SharedEdge]
     thickness: float
+    source_solid: cq.Shape | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -604,10 +606,17 @@ def load_step_panels(step_path: str, thickness: float = 3.2) -> BinModel:
             outer_normal=bd["outer_normal"],
             width=w,
             height=h,
+            outer_face=bd["outer_face"],
             outer_edges=bd["edges"],
         )
 
     # Detect shared edges
     shared_edges = _find_shared_edges(panels)
 
-    return BinModel(panels=panels, shared_edges=shared_edges, thickness=thickness)
+    source_solid = solids[0] if len(solids) == 1 else None
+    return BinModel(
+        panels=panels,
+        shared_edges=shared_edges,
+        thickness=thickness,
+        source_solid=source_solid,
+    )

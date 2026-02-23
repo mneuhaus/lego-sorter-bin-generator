@@ -22,6 +22,11 @@ try:
 except ImportError:
     svgwrite = None  # type: ignore[assignment]
 
+try:
+    from shapely.geometry import Polygon
+except ImportError:
+    Polygon = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # 2D helpers
@@ -43,6 +48,137 @@ def _translate_pts(
     pts: list[tuple[float, float]], dx: float, dy: float,
 ) -> list[tuple[float, float]]:
     return [(x + dx, y + dy) for x, y in pts]
+
+
+def _point_in_polygon(
+    pt: tuple[float, float],
+    poly: list[tuple[float, float]],
+) -> bool:
+    """Ray-casting point-in-polygon test."""
+    x, y = pt
+    inside = False
+    n = len(poly)
+    if n < 3:
+        return False
+
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)):
+            x_inter = (xj - xi) * (y - yi) / (yj - yi) + xi
+            if x < x_inter:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _overlap_area(
+    a: list[tuple[float, float]],
+    b: list[tuple[float, float]],
+) -> float:
+    if Polygon is None:
+        return 0.0
+    try:
+        pa = Polygon(a)
+        pb = Polygon(b)
+        if not pa.is_valid or not pb.is_valid:
+            return 0.0
+        return pa.intersection(pb).area
+    except Exception:
+        return 0.0
+
+
+def _distance_between(
+    a: list[tuple[float, float]],
+    b: list[tuple[float, float]],
+) -> float:
+    if Polygon is None:
+        return float("inf")
+    try:
+        pa = Polygon(a)
+        pb = Polygon(b)
+        if not pa.is_valid or not pb.is_valid:
+            return float("inf")
+        return pa.distance(pb)
+    except Exception:
+        return float("inf")
+
+
+def _any_overlap(
+    outline: list[tuple[float, float]],
+    others: list[list[tuple[float, float]]],
+    min_area: float = 0.01,
+) -> bool:
+    for other in others:
+        if _overlap_area(outline, other) > min_area:
+            return True
+    return False
+
+
+def _total_overlap_area(
+    outline: list[tuple[float, float]],
+    others: list[list[tuple[float, float]]],
+) -> float:
+    return sum(_overlap_area(outline, other) for other in others)
+
+
+def _too_close(
+    outline: list[tuple[float, float]],
+    others: list[list[tuple[float, float]]],
+    min_clearance: float,
+) -> bool:
+    if Polygon is None:
+        return False
+    for other in others:
+        if _distance_between(outline, other) < min_clearance:
+            return True
+    return False
+
+
+def _push_out_until_clear(
+    outline: list[tuple[float, float]],
+    out_n: tuple[float, float],
+    placed_others: list[list[tuple[float, float]]],
+    step: float,
+    min_clearance: float = 0.0,
+    max_extra: float = 80.0,
+) -> tuple[list[tuple[float, float]], float]:
+    """Translate outline along out_n until it no longer overlaps placed panels."""
+    needs_move = _any_overlap(outline, placed_others)
+    if min_clearance > 0.0:
+        needs_move = needs_move or _too_close(outline, placed_others, min_clearance)
+    if not placed_others or not needs_move:
+        return outline, 0.0
+
+    def _push_dir(sign: float) -> tuple[list[tuple[float, float]], float, bool]:
+        moved = list(outline)
+        pushed = 0.0
+        while pushed < max_extra:
+            overlap = _any_overlap(moved, placed_others)
+            close = min_clearance > 0.0 and _too_close(moved, placed_others, min_clearance)
+            if not overlap and not close:
+                break
+            moved = _translate_pts(moved, out_n[0] * step * sign, out_n[1] * step * sign)
+            pushed += step
+        overlap = _any_overlap(moved, placed_others)
+        close = min_clearance > 0.0 and _too_close(moved, placed_others, min_clearance)
+        return moved, pushed * sign, not overlap and not close
+
+    moved_fwd, pushed_fwd, ok_fwd = _push_dir(1.0)
+    if ok_fwd:
+        return moved_fwd, pushed_fwd
+
+    moved_rev, pushed_rev, ok_rev = _push_dir(-1.0)
+    if ok_rev:
+        return moved_rev, pushed_rev
+
+    # Neither direction fully cleared overlap; keep the better one.
+    area_fwd = _total_overlap_area(moved_fwd, placed_others)
+    area_rev = _total_overlap_area(moved_rev, placed_others)
+    if area_rev < area_fwd:
+        return moved_rev, pushed_rev
+    return moved_fwd, pushed_fwd
 
 
 def _bbox_area(pts: list[tuple[float, float]]) -> float:
@@ -260,9 +396,22 @@ def _outward_normal_2d(
         return (0.0, 1.0)
     n1 = (-dy / length, dx / length)
     n2 = (dy / length, -dx / length)
+    mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
+    eps = max(0.25, min(2.0, length * 0.05))
+
+    p1 = (mid[0] + n1[0] * eps, mid[1] + n1[1] * eps)
+    p2 = (mid[0] + n2[0] * eps, mid[1] + n2[1] * eps)
+    inside1 = _point_in_polygon(p1, outline)
+    inside2 = _point_in_polygon(p2, outline)
+
+    if inside1 and not inside2:
+        return n2
+    if inside2 and not inside1:
+        return n1
+
+    # Fallback for ambiguous cases.
     cx = sum(p[0] for p in outline) / len(outline)
     cy = sum(p[1] for p in outline) / len(outline)
-    mid = ((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
     to_c = (cx - mid[0], cy - mid[1])
     if n1[0] * to_c[0] + n1[1] * to_c[1] < 0:
         return n1
@@ -378,6 +527,20 @@ def _compute_unfolded_layout(
                                                      target[1] - xf_mid2[1])
                 nbr_xform = T_trans2.compose(T_rot)
                 final_outline = nbr_xform.apply_pts(nbr_p2d.outline)
+
+            # If this panel still overlaps existing placed panels, push it farther
+            # along the outward normal until clear.
+            others = list(placed_outline.values())
+            final_outline, pushed = _push_out_until_clear(
+                final_outline,
+                out_n,
+                others,
+                step=max(gap, 2.0),
+                min_clearance=max(0.0, gap),
+            )
+            if pushed > 0:
+                T_push = Affine2D.from_translation(out_n[0] * pushed, out_n[1] * pushed)
+                nbr_xform = T_push.compose(nbr_xform)
 
             placed_outline[neighbor] = final_outline
             placed_xform[neighbor] = nbr_xform
