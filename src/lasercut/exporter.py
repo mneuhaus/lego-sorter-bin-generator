@@ -819,6 +819,22 @@ def _make_oriented_geometry(
     }
 
 
+def _best_required_sheet_size(
+    dims: list[tuple[float, float, float]],
+) -> tuple[float, float, float]:
+    """Return the most compact (width, height, angle_deg) from oriented dims."""
+    if not dims:
+        return (0.0, 0.0, 0.0)
+    return min(
+        dims,
+        key=lambda d: (
+            d[0] * d[1],           # smallest bounding-box area
+            max(d[0], d[1]),       # then smallest longest side
+            d[0] + d[1],           # then smallest perimeter proxy
+        ),
+    )
+
+
 def _sheet_origins(
     n_sheets: int,
     sheet_width: float,
@@ -866,16 +882,22 @@ def _compute_packed_layout(
     oriented_by_name: dict[str, list[dict[str, object]]] = {}
     for name, panel in panel_map.items():
         variants: list[dict[str, object]] = []
+        dims_all: list[tuple[float, float, float]] = []
         for angle in angles:
             g = _make_oriented_geometry(panel, angle)
             width = float(g["width"])
             height = float(g["height"])
+            angle_deg = (math.degrees(angle) % 360.0)
+            dims_all.append((width, height, angle_deg))
             if width <= sheet_width + 1e-6 and height <= sheet_height + 1e-6:
                 variants.append(g)
         if not variants:
+            req_w, req_h, req_angle = _best_required_sheet_size(dims_all)
             raise ValueError(
                 f"Panel '{name}' does not fit into the requested sheet size "
-                f"({sheet_width} x {sheet_height} mm)"
+                f"({sheet_width} x {sheet_height} mm). "
+                f"Minimum needed (with current rotations) is about "
+                f"{req_w:.1f} x {req_h:.1f} mm at {req_angle:.1f}°."
             )
         oriented_by_name[name] = variants
 
