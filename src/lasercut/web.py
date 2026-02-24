@@ -737,21 +737,10 @@ def _render_index(error: str | None = None) -> str:
     }
     .svg-tools {
       display: flex;
-      justify-content: space-between;
+      justify-content: flex-end;
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
-    }
-    .svg-tools label {
-      font-size: 12px;
-      color: #2f3f35;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-weight: 700;
-    }
-    .svg-tools input[type="range"] {
-      width: 180px;
     }
     .svg-open {
       font-size: 12px;
@@ -763,18 +752,17 @@ def _render_index(error: str | None = None) -> str:
       border: 1px solid #d3ddd5;
       border-radius: 10px;
       background: #f8faf8;
-      height: 260px;
-      overflow: auto;
+      overflow: hidden;
       position: relative;
+      padding: 8px;
     }
     .svg-inner {
-      transform-origin: 0 0;
-      padding: 8px;
-      width: max-content;
+      width: 100%;
     }
     .svg-inner img {
       display: block;
-      max-width: none;
+      width: 100%;
+      max-width: 100%;
       height: auto;
       border: 1px solid #e0e6e1;
       background: #fff;
@@ -1206,16 +1194,6 @@ def _render_index(error: str | None = None) -> str:
       return card;
     }
 
-    function initSvgZoom(slider, valueEl, inner) {
-      const apply = () => {
-        const zoom = Number(slider.value || 1);
-        inner.style.transform = `scale(${zoom})`;
-        valueEl.textContent = `${Math.round(zoom * 100)}%`;
-      };
-      slider.addEventListener('input', apply);
-      apply();
-    }
-
     function initMeshViewer(canvas, meshData) {
       if (!window.THREE || !meshData || !meshData.vertices || !meshData.triangles || meshData.triangles.length === 0) {
         const ctx = canvas.getContext('2d');
@@ -1394,18 +1372,6 @@ def _render_index(error: str | None = None) -> str:
 
       const svgTools = document.createElement('div');
       svgTools.className = 'svg-tools';
-      const zoomLabel = document.createElement('label');
-      zoomLabel.textContent = 'SVG Zoom';
-      const slider = document.createElement('input');
-      slider.type = 'range';
-      slider.min = '0.4';
-      slider.max = '4';
-      slider.step = '0.1';
-      slider.value = '1';
-      const zoomValue = document.createElement('span');
-      zoomValue.textContent = '100%';
-      zoomLabel.appendChild(slider);
-      zoomLabel.appendChild(zoomValue);
 
       const open = document.createElement('a');
       open.className = 'svg-open';
@@ -1414,7 +1380,6 @@ def _render_index(error: str | None = None) -> str:
       open.rel = 'noreferrer';
       open.textContent = 'SVG in neuem Tab';
 
-      svgTools.appendChild(zoomLabel);
       svgTools.appendChild(open);
 
       const svgWrap = document.createElement('div');
@@ -1433,7 +1398,6 @@ def _render_index(error: str | None = None) -> str:
       card.appendChild(svgTools);
       card.appendChild(svgWrap);
 
-      initSvgZoom(slider, zoomValue, svgInner);
       initMeshViewer(canvas, item.mesh);
 
       return card;
