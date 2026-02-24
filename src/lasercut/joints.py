@@ -146,8 +146,17 @@ def _edge_endpoints(edge: cq.Edge) -> tuple[tuple[float, float, float], tuple[fl
     """Return edge endpoints as tuples."""
     verts = edge.Vertices()
     if len(verts) >= 2:
-        p0 = verts[0].toVector()
-        p1 = verts[1].toVector()
+        if hasattr(verts[0], "toVector") and hasattr(verts[1], "toVector"):
+            p0 = verts[0].toVector()
+            p1 = verts[1].toVector()
+        elif hasattr(verts[0], "toTuple") and hasattr(verts[1], "toTuple"):
+            t0 = verts[0].toTuple()
+            t1 = verts[1].toTuple()
+            return ((t0[0], t0[1], t0[2]), (t1[0], t1[1], t1[2]))
+        else:
+            c0 = verts[0].Center()
+            c1 = verts[1].Center()
+            return ((c0.x, c0.y, c0.z), (c1.x, c1.y, c1.z))
         return ((p0.x, p0.y, p0.z), (p1.x, p1.y, p1.z))
 
     p0 = edge.positionAt(0)
@@ -338,8 +347,18 @@ def _apply_finger_joints_cqwarehouse(
     except ImportError as exc:
         raise RuntimeError("cq_warehouse is not installed") from exc
 
+    # Classify seams first so inset seams can be treated as through-slots.
+    finger_seams: list[SharedEdge] = []
+    through_slot_seams: list[tuple[SharedEdge, str]] = []
+    for se in model.shared_edges:
+        jt, slot_panel = _classify_joint_type(se, model.panels)
+        if jt == "through_slot" and slot_panel is not None:
+            through_slot_seams.append((se, slot_panel))
+        else:
+            finger_seams.append(se)
+
     source_solid = _to_cuttable(model.source_solid)
-    joint_edges = _match_source_edges_for_shared_edges(source_solid, model.shared_edges)
+    joint_edges = _match_source_edges_for_shared_edges(source_solid, finger_seams)
     if not joint_edges:
         raise RuntimeError("No source edges matched shared seams for cq_warehouse")
 
@@ -404,7 +423,24 @@ def _apply_finger_joints_cqwarehouse(
     if not matched_names:
         raise RuntimeError("cq_warehouse faces could not be matched back to panels")
 
-    print(f"  cq_warehouse: jointed {len(matched_names)} panels from {len(joint_edges)} edges")
+    # Apply inset through-slots after face-based finger generation.
+    if through_slot_seams:
+        corners = _find_corner_points(model.shared_edges)
+        for se, slot_panel_name in through_slot_seams:
+            print(f"  Through-slot: {se.panel_a}--{se.panel_b} (slot in {slot_panel_name})")
+            _apply_through_slot(
+                se,
+                slot_panel_name,
+                panels,
+                corners,
+                model.thickness,
+                finger_width=finger_width,
+            )
+
+    print(
+        f"  cq_warehouse: jointed {len(matched_names)} panels "
+        f"from {len(joint_edges)} edges ({len(through_slot_seams)} through-slots)"
+    )
     return BinModel(
         panels=panels,
         shared_edges=model.shared_edges,
@@ -641,6 +677,125 @@ def _compute_finger_layout(
     return fingers
 
 
+def _merge_intervals(intervals: list[tuple[float, float]], tol: float = 0.05) -> list[tuple[float, float]]:
+    if not intervals:
+        return []
+    intervals = sorted(intervals)
+    merged = [intervals[0]]
+    for lo, hi in intervals[1:]:
+        if lo <= merged[-1][1] + tol:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _complement_intervals(
+    lo: float,
+    hi: float,
+    keep: list[tuple[float, float]],
+    tol: float = 0.05,
+) -> list[tuple[float, float]]:
+    """Return intervals in [lo, hi] not covered by *keep*."""
+    if hi - lo <= tol:
+        return []
+
+    clipped = [
+        (max(lo, a), min(hi, b))
+        for a, b in keep
+        if min(hi, b) - max(lo, a) > tol
+    ]
+    clipped = _merge_intervals(clipped, tol=tol)
+
+    out: list[tuple[float, float]] = []
+    cur = lo
+    for a, b in clipped:
+        if a - cur > tol:
+            out.append((cur, a))
+        cur = max(cur, b)
+    if hi - cur > tol:
+        out.append((cur, hi))
+    return out
+
+
+def _inset_slot_intervals_from_lip(
+    se: SharedEdge,
+    slot_panel: Panel,
+    slot_start: tuple[float, float, float],
+    slot_end: tuple[float, float, float],
+    edge_dir: tuple[float, float, float],
+    slot_in_plane: tuple[float, float, float],
+    thickness: float,
+    finger_width: float,
+    start_keepout: float,
+    end_keepout: float,
+) -> list[tuple[float, float]]:
+    """Find slot intervals where the slot-panel lip is full-depth (not notched).
+
+    For inset seams with a notched lip, we only cut through-slot segments where
+    the outer lip is present. This avoids removing bridges at lip-notch locations.
+    """
+    d_len = _vec_len(_vec_sub(slot_end, slot_start))
+    if d_len < 1e-6:
+        return []
+
+    # Gather seam-parallel boundary segments near the seam on the lip/outside side.
+    raw: list[tuple[float, float, float]] = []  # (u, lo, hi)
+    search_band = max(thickness * 3.5, 12.0)
+    for p0, p1 in slot_panel.outer_edges:
+        pe = _vec_sub(p1, p0)
+        pe_len = _vec_len(pe)
+        if pe_len < 0.2:
+            continue
+        pe_dir = _normalize(pe)
+        if abs(_vec_dot(pe_dir, edge_dir)) < 0.95:
+            continue
+
+        v0 = _vec_sub(p0, slot_start)
+        v1 = _vec_sub(p1, slot_start)
+        t0 = _vec_dot(v0, edge_dir)
+        t1 = _vec_dot(v1, edge_dir)
+        u0 = _vec_dot(v0, slot_in_plane)
+        u1 = _vec_dot(v1, slot_in_plane)
+
+        # Nearly constant offset from seam, i.e. seam-parallel lip segment.
+        if abs(u0 - u1) > max(0.8, thickness * 0.4):
+            continue
+        u = (u0 + u1) / 2.0
+        if u > 0.4:
+            continue  # interior side; seam lip is on negative side
+        if abs(u) > search_band:
+            continue
+
+        lo, hi = (t0, t1) if t0 <= t1 else (t1, t0)
+        lo = max(0.0, lo)
+        hi = min(d_len, hi)
+        if hi - lo > 0.2:
+            raw.append((u, lo, hi))
+
+    if not raw:
+        return []
+
+    # Full-depth lip segments are the farthest outward (most negative u).
+    u_outer = min(u for u, _, _ in raw)
+    u_cutoff = u_outer + max(0.8, thickness * 0.5)
+    selected = [(lo, hi) for u, lo, hi in raw if u <= u_cutoff]
+    selected = _merge_intervals(selected)
+
+    # Apply corner keepouts and drop tiny fragments.
+    usable_lo = start_keepout
+    usable_hi = d_len - end_keepout
+    min_seg = max(12.0, finger_width * 0.9)
+    clipped: list[tuple[float, float]] = []
+    for lo, hi in selected:
+        lo = max(lo, usable_lo)
+        hi = min(hi, usable_hi)
+        if hi - lo >= min_seg:
+            clipped.append((lo, hi))
+
+    return clipped
+
+
 # ---------------------------------------------------------------------------
 # Main joint application
 # ---------------------------------------------------------------------------
@@ -651,11 +806,12 @@ def _apply_through_slot(
     panels: dict[str, Panel],
     corners: list[tuple[tuple[float, float, float], set[str]]],
     thickness: float,
+    finger_width: float = 20.0,
 ) -> None:
     """Cut a through-slot in one panel and matching tabs on the other.
 
-    The *slot_panel_name* panel gets a continuous rectangular slot cut through it.
-    The other panel gets trimmed so only tabs protrude through the slot.
+    The *slot_panel_name* panel gets one or more through-slot segments.
+    The other panel is recessed between those segments so only matching tabs remain.
 
     Parameters
     ----------
@@ -674,8 +830,10 @@ def _apply_through_slot(
     # Identify which panel is slot vs wall (the one sliding through)
     if slot_panel_name == se.panel_a:
         slot_panel = panels[se.panel_a]
+        wall_panel = panels[se.panel_b]
     else:
         slot_panel = panels[se.panel_b]
+        wall_panel = panels[se.panel_a]
 
     # Edge direction in slot-panel plane
     slot_start, slot_end = _project_edge_to_panel(se, slot_panel)
@@ -688,8 +846,9 @@ def _apply_through_slot(
     # Keepouts at corners
     start_keepout, end_keepout = _corner_keepout_for_edge(se, corners, thickness)
 
-    slot_length = d_len - start_keepout - end_keepout
-    if slot_length <= 0:
+    usable_start = start_keepout
+    usable_end = d_len - end_keepout
+    if usable_end - usable_start <= 0:
         return
 
     # Direction through the slot panel thickness (perpendicular to slot panel face)
@@ -702,26 +861,96 @@ def _apply_through_slot(
     # In-plane direction from shared edge into slot panel interior.
     slot_in_plane = _edge_inward_direction(slot_panel, slot_start, slot_end)
 
-    # The slot origin is at projected edge start + keepout along edge_dir
-    slot_origin = _add(slot_start, _scale(edge_dir, start_keepout))
-
-    # Cut through-slot in the slot panel:
-    # A box that extends along edge_dir for slot_length,
-    # extends into slot-panel interior for wall thickness,
-    # and extends through the slot panel's full thickness
-    # We overshoot the slot depth by 2x thickness to ensure it goes all the way through
-    solid_slot = _to_cuttable(slot_panel.solid)
-    slot_box = _make_oriented_box(
-        origin=slot_origin,
-        x_dir=edge_dir,
-        y_dir=slot_in_plane,
-        z_dir=into_slot,
-        dx=slot_length,
-        dy=thickness,
-        dz=thickness * 2,  # overshoot to ensure full penetration
+    slot_intervals = _inset_slot_intervals_from_lip(
+        se=se,
+        slot_panel=slot_panel,
+        slot_start=slot_start,
+        slot_end=slot_end,
+        edge_dir=edge_dir,
+        slot_in_plane=slot_in_plane,
+        thickness=thickness,
+        finger_width=finger_width,
+        start_keepout=start_keepout,
+        end_keepout=end_keepout,
     )
-    result = solid_slot.cut(slot_box)
-    slot_panel.solid = _to_cuttable(result)
+
+    if not slot_intervals:
+        # Fallback to one continuous slot if lip-based segmentation is unavailable.
+        slot_intervals = [(usable_start, usable_end)]
+
+    # Cut through-slot segments in the slot panel.
+    solid_slot = _to_cuttable(slot_panel.solid)
+    for lo, hi in slot_intervals:
+        slot_length = hi - lo
+        if slot_length <= 0:
+            continue
+        slot_origin = _add(slot_start, _scale(edge_dir, lo))
+        slot_box = _make_oriented_box(
+            origin=slot_origin,
+            x_dir=edge_dir,
+            y_dir=slot_in_plane,
+            z_dir=into_slot,
+            dx=slot_length,
+            dy=thickness,
+            dz=thickness * 2,  # overshoot to ensure full penetration
+        )
+        solid_slot = _to_cuttable(solid_slot.cut(slot_box))
+
+    slot_panel.solid = solid_slot
+
+    # Recess non-slot regions on the wall panel so only matching tabs remain.
+    wall_start, wall_end = _project_edge_to_panel(se, wall_panel)
+    wall_vec = _vec_sub(wall_end, wall_start)
+    wall_len = _vec_len(wall_vec)
+    if wall_len < 1e-6:
+        return
+    wall_dir = _normalize(wall_vec)
+
+    # Keep wall and slot param directions aligned so interval reuse is valid.
+    if _vec_dot(wall_dir, edge_dir) < 0:
+        wall_start, wall_end = wall_end, wall_start
+        wall_dir = (-wall_dir[0], -wall_dir[1], -wall_dir[2])
+
+    # Keep only explicit tab intervals on the wall; recess everything else.
+    # This avoids tiny stray tabs at seam ends caused by corner keepouts.
+    wall_usable_start = 0.0
+    wall_usable_end = wall_len
+    if wall_usable_end - wall_usable_start <= 0:
+        return
+
+    recess_intervals = _complement_intervals(
+        wall_usable_start,
+        wall_usable_end,
+        slot_intervals,
+    )
+    if not recess_intervals:
+        return
+
+    wall_in_plane = _edge_inward_direction(wall_panel, wall_start, wall_end)
+    into_wall = _normalize((
+        -wall_panel.outer_normal[0],
+        -wall_panel.outer_normal[1],
+        -wall_panel.outer_normal[2],
+    ))
+
+    solid_wall = _to_cuttable(wall_panel.solid)
+    for lo, hi in recess_intervals:
+        cut_len = hi - lo
+        if cut_len <= 0:
+            continue
+        cut_origin = _add(wall_start, _scale(wall_dir, lo))
+        recess_box = _make_oriented_box(
+            origin=cut_origin,
+            x_dir=wall_dir,
+            y_dir=wall_in_plane,
+            z_dir=into_wall,
+            dx=cut_len,
+            dy=thickness,
+            dz=thickness * 2,
+        )
+        solid_wall = _to_cuttable(solid_wall.cut(recess_box))
+
+    wall_panel.solid = solid_wall
 
 
 def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel:
@@ -733,8 +962,8 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
     - At odd-indexed positions (1, 3, 5, ...): Panel A gets cut, Panel B keeps material
 
     For inset panels (shared edge crosses one panel's face):
-    - The panel whose face is crossed gets a continuous through-slot
-    - The inset wall panel slides through that slot
+    - The crossed panel gets one or more through-slot segments
+    - The inset wall panel is recessed between segments to form matching tabs
 
     Returns a new BinModel with modified panel solids.
     """
@@ -756,7 +985,14 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
 
         if joint_type == "through_slot" and slot_panel_name is not None:
             print(f"  Through-slot: {se.panel_a}--{se.panel_b} (slot in {slot_panel_name})")
-            _apply_through_slot(se, slot_panel_name, panels, corners, thickness)
+            _apply_through_slot(
+                se,
+                slot_panel_name,
+                panels,
+                corners,
+                thickness,
+                finger_width=finger_width,
+            )
             continue
 
         # Standard finger joint

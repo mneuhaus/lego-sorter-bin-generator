@@ -282,6 +282,7 @@ class Affine2D:
 class Panel2D:
     name: str
     outline: list[tuple[float, float]]
+    holes: list[list[tuple[float, float]]]
     u_axis: tuple[float, float, float]
     v_axis: tuple[float, float, float]
     offset_x: float
@@ -309,10 +310,22 @@ def _build_local_axes(
     return u, v
 
 
+def _wire_vertices_3d(wire: cq.Wire) -> list[tuple[float, float, float]]:
+    explorer = BRepTools_WireExplorer(wire.wrapped)
+    verts_3d: list[tuple[float, float, float]] = []
+    while explorer.More():
+        vert = explorer.CurrentVertex()
+        pnt = BRep_Tool.Pnt_s(vert)
+        verts_3d.append((pnt.X(), pnt.Y(), pnt.Z()))
+        explorer.Next()
+    return verts_3d
+
+
 def _project_panel(
     solid: cq.Solid,
     outer_normal: tuple[float, float, float],
     name: str,
+    frame: Panel2D | None = None,
 ) -> Panel2D | None:
     wp = cq.Workplane().add(solid)
     faces = wp.faces().vals()
@@ -334,25 +347,51 @@ def _project_panel(
         return None
 
     outer_wire = best_face.outerWire()
-    explorer = BRepTools_WireExplorer(outer_wire.wrapped)
-    verts_3d: list[tuple[float, float, float]] = []
-    while explorer.More():
-        v = explorer.CurrentVertex()
-        pnt = BRep_Tool.Pnt_s(v)
-        verts_3d.append((pnt.X(), pnt.Y(), pnt.Z()))
-        explorer.Next()
-    if not verts_3d:
+    outer_verts_3d = _wire_vertices_3d(outer_wire)
+    if not outer_verts_3d:
         return None
 
+    hole_wires = list(best_face.innerWires())
+    hole_verts_3d = [_wire_vertices_3d(w) for w in hole_wires]
+
+    if frame is not None:
+        # Project into an existing local frame so overlays align exactly.
+        u = frame.u_axis
+        v = frame.v_axis
+        min_x = frame.offset_x
+        min_y = frame.offset_y
+        pts_2d = [(_vec_dot(pt, u) - min_x, _vec_dot(pt, v) - min_y) for pt in outer_verts_3d]
+        holes_2d = [
+            [(_vec_dot(pt, u) - min_x, _vec_dot(pt, v) - min_y) for pt in verts]
+            for verts in hole_verts_3d
+            if len(verts) >= 3
+        ]
+        return Panel2D(
+            name=name, outline=pts_2d, holes=holes_2d,
+            u_axis=u, v_axis=v,
+            offset_x=min_x, offset_y=min_y,
+        )
+
     u, v = _build_local_axes(outer_normal)
-    raw = [(_vec_dot(pt, u), _vec_dot(pt, v)) for pt in verts_3d]
+    raw_outline = [(_vec_dot(pt, u), _vec_dot(pt, v)) for pt in outer_verts_3d]
+    raw_holes = [
+        [(_vec_dot(pt, u), _vec_dot(pt, v)) for pt in verts]
+        for verts in hole_verts_3d
+        if len(verts) >= 3
+    ]
 
-    rot = _min_bbox_angle(raw)
-    rotated = _rotate_pts(raw, -rot)
+    rot = _min_bbox_angle(raw_outline)
+    outline_rot = _rotate_pts(raw_outline, -rot)
+    holes_rot = [_rotate_pts(h, -rot) for h in raw_holes]
 
-    min_x = min(p[0] for p in rotated)
-    min_y = min(p[1] for p in rotated)
-    pts_2d = [(p[0] - min_x, p[1] - min_y) for p in rotated]
+    min_x = min(p[0] for p in outline_rot)
+    min_y = min(p[1] for p in outline_rot)
+    pts_2d = [(p[0] - min_x, p[1] - min_y) for p in outline_rot]
+    holes_2d = [
+        [(p[0] - min_x, p[1] - min_y) for p in hole]
+        for hole in holes_rot
+        if len(hole) >= 3
+    ]
 
     # Rotated 3D axes:
     #   final_x = dot(P, u)*cos(-rot) - dot(P, v)*sin(-rot) - min_x
@@ -363,7 +402,7 @@ def _project_panel(
     v_rot = tuple(sin_r * u[k] + cos_r * v[k] for k in range(3))
 
     return Panel2D(
-        name=name, outline=pts_2d,
+        name=name, outline=pts_2d, holes=holes_2d,
         u_axis=u_rot, v_axis=v_rot,
         offset_x=min_x, offset_y=min_y,
     )
@@ -422,7 +461,7 @@ def _compute_unfolded_layout(
     model: BinModel,
     panel_map: dict[str, Panel2D],
     gap: float = 4.0,
-) -> list[tuple[str, list[tuple[float, float]]]]:
+) -> list[tuple[str, list[tuple[float, float]], list[list[tuple[float, float]]], Affine2D]]:
     """BFS from the bottom panel, placing neighbours next to shared edges.
 
     Each neighbour is reflected across the shared edge and shifted outward
@@ -433,10 +472,12 @@ def _compute_unfolded_layout(
 
     # For each placed panel: final SVG outline + Affine2D that maps local -> SVG
     placed_outline: dict[str, list[tuple[float, float]]] = {}
+    placed_holes: dict[str, list[list[tuple[float, float]]]] = {}
     placed_xform: dict[str, Affine2D] = {}
 
     # Root at the origin
     placed_outline[root] = list(panel_map[root].outline)
+    placed_holes[root] = [list(h) for h in panel_map[root].holes]
     placed_xform[root] = Affine2D.identity()
 
     queue: deque[str] = deque([root])
@@ -513,6 +554,7 @@ def _compute_unfolded_layout(
             nbr_xform = T_trans.compose(T_rot_ref)
 
             final_outline = nbr_xform.apply_pts(nbr_p2d.outline)
+            final_holes = [nbr_xform.apply_pts(h) for h in nbr_p2d.holes]
 
             # Verify neighbour body extends outward
             nbr_cx = sum(p[0] for p in final_outline) / len(final_outline)
@@ -527,6 +569,7 @@ def _compute_unfolded_layout(
                                                      target[1] - xf_mid2[1])
                 nbr_xform = T_trans2.compose(T_rot)
                 final_outline = nbr_xform.apply_pts(nbr_p2d.outline)
+                final_holes = [nbr_xform.apply_pts(h) for h in nbr_p2d.holes]
 
             # If this panel still overlaps existing placed panels, push it farther
             # along the outward normal until clear.
@@ -541,8 +584,13 @@ def _compute_unfolded_layout(
             if pushed > 0:
                 T_push = Affine2D.from_translation(out_n[0] * pushed, out_n[1] * pushed)
                 nbr_xform = T_push.compose(nbr_xform)
+                final_holes = [
+                    _translate_pts(h, out_n[0] * pushed, out_n[1] * pushed)
+                    for h in final_holes
+                ]
 
             placed_outline[neighbor] = final_outline
+            placed_holes[neighbor] = final_holes
             placed_xform[neighbor] = nbr_xform
             visited.add(neighbor)
             queue.append(neighbor)
@@ -554,6 +602,8 @@ def _compute_unfolded_layout(
             all_y = [pt[1] for pts in placed_outline.values() for pt in pts]
             y_off = max(all_y) + 20.0 if all_y else 0.0
             placed_outline[name] = _translate_pts(p.outline, 0, y_off)
+            placed_holes[name] = [_translate_pts(h, 0, y_off) for h in p.holes]
+            placed_xform[name] = Affine2D.from_translation(0, y_off)
 
     # Shift so all coordinates are positive
     all_x = [pt[0] for pts in placed_outline.values() for pt in pts]
@@ -563,15 +613,25 @@ def _compute_unfolded_layout(
         sy = -min(all_y) + 5.0
         for name in placed_outline:
             placed_outline[name] = _translate_pts(placed_outline[name], sx, sy)
+            placed_holes[name] = [_translate_pts(h, sx, sy) for h in placed_holes.get(name, [])]
+            placed_xform[name] = Affine2D.from_translation(sx, sy).compose(placed_xform[name])
 
-    return [(name, pts) for name, pts in placed_outline.items()]
+    return [
+        (name, placed_outline[name], placed_holes.get(name, []), placed_xform[name])
+        for name in placed_outline
+    ]
 
 
 # ---------------------------------------------------------------------------
 # SVG export
 # ---------------------------------------------------------------------------
 
-def export_svg(model: BinModel, output_path: str, spacing: float = 5.0) -> None:
+def export_svg(
+    model: BinModel,
+    output_path: str,
+    spacing: float = 5.0,
+    reference_model: BinModel | None = None,
+) -> None:
     """Export all panels as flat 2D outlines into an SVG file.
 
     Uses an unfolded layout with 4 mm gaps between adjacent panels.
@@ -592,8 +652,8 @@ def export_svg(model: BinModel, output_path: str, spacing: float = 5.0) -> None:
     if not placed:
         raise ValueError("No panels could be placed")
 
-    all_x = [p[0] for _, pts in placed for p in pts]
-    all_y = [p[1] for _, pts in placed for p in pts]
+    all_x = [p[0] for _, pts, _, _ in placed for p in pts]
+    all_y = [p[1] for _, pts, _, _ in placed for p in pts]
     total_w = max(all_x) + spacing
     total_h = max(all_y) + spacing
 
@@ -611,7 +671,7 @@ def export_svg(model: BinModel, output_path: str, spacing: float = 5.0) -> None:
         stroke="none",
     ))
 
-    for name, pts in placed:
+    for name, pts, holes, xform in placed:
         if not pts:
             continue
         d_parts = [f"M {pts[0][0]:.4f},{pts[0][1]:.4f}"]
@@ -625,6 +685,43 @@ def export_svg(model: BinModel, output_path: str, spacing: float = 5.0) -> None:
             stroke_width="0.1",
             fill="none",
         ))
+
+        if reference_model is not None and name in reference_model.panels and name in panel_map:
+            ref_panel = reference_model.panels[name]
+            ref_p2d = _project_panel(
+                ref_panel.solid,
+                ref_panel.outer_normal,
+                name,
+                frame=panel_map[name],
+            )
+            if ref_p2d is not None and ref_p2d.outline:
+                ref_outline = xform.apply_pts(ref_p2d.outline)
+                r_parts = [f"M {ref_outline[0][0]:.4f},{ref_outline[0][1]:.4f}"]
+                for p in ref_outline[1:]:
+                    r_parts.append(f"L {p[0]:.4f},{p[1]:.4f}")
+                r_parts.append("Z")
+                dwg.add(dwg.path(
+                    d=" ".join(r_parts),
+                    stroke="#1BAA5C",
+                    stroke_width="0.12",
+                    stroke_dasharray="2.0,1.6",
+                    fill="none",
+                    opacity="0.9",
+                ))
+
+        for hole in holes:
+            if len(hole) < 3:
+                continue
+            h_parts = [f"M {hole[0][0]:.4f},{hole[0][1]:.4f}"]
+            for p in hole[1:]:
+                h_parts.append(f"L {p[0]:.4f},{p[1]:.4f}")
+            h_parts.append("Z")
+            dwg.add(dwg.path(
+                d=" ".join(h_parts),
+                stroke="#000000",
+                stroke_width="0.1",
+                fill="none",
+            ))
 
         cx = sum(p[0] for p in pts) / len(pts)
         cy = sum(p[1] for p in pts) / len(pts)

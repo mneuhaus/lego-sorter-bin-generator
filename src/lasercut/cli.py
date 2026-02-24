@@ -16,13 +16,13 @@ def main():
     parser.add_argument("--output", default="output", help="Output directory")
     args = parser.parse_args()
 
-    model = load_step_panels(args.step_file, args.thickness)
-    model = apply_finger_joints(model, args.finger_width)
+    original_model = load_step_panels(args.step_file, args.thickness)
+    model = apply_finger_joints(original_model, args.finger_width)
 
     os.makedirs(args.output, exist_ok=True)
     name = os.path.splitext(os.path.basename(args.step_file))[0]
     output_path = os.path.join(args.output, f"{name}.svg")
-    export_svg(model, output_path)
+    export_svg(model, output_path, reference_model=original_model)
     print(f"SVG written to {output_path}")
 
 
