@@ -325,13 +325,21 @@ def _make_finger_joint_faces_safe(
                 primary_face_index, secondary_face_index = secondary_face_index, primary_face_index
 
         for i in [primary_face_index, secondary_face_index]:
+            align_to_bottom = i == primary_face_index
+            if seam_by_edge is not None and common_edge in seam_by_edge:
+                se = seam_by_edge[common_edge]
+                if {se.panel_a, se.panel_b} in (
+                    {"right_wall", "back_wall"},
+                    {"left_wall", "back_wall"},
+                ):
+                    align_to_bottom = not align_to_bottom
             working_faces[i] = working_faces[i].makeFingerJoints(
                 common_edge,
                 finger_depths[common_edge],
                 target_finger_width,
                 corner_face_counter,
                 open_internal_vertices,
-                alignToBottom=i == primary_face_index,
+                alignToBottom=align_to_bottom,
                 externalCorner=external_corners[common_edge],
                 faceIndex=i,
             )
@@ -1300,6 +1308,10 @@ def apply_finger_joints(
         # Standard finger joint
         pa = panels[se.panel_a]
         pb = panels[se.panel_b]
+        flip_phase = {se.panel_a, se.panel_b} in (
+            {"back_wall", "right_wall"},
+            {"back_wall", "left_wall"},
+        )
 
         # Shared edge mapped onto each panel plane.
         edge_a_start, edge_a_end = _project_edge_to_panel(se, pa)
@@ -1342,7 +1354,11 @@ def apply_finger_joints(
             finger_origin_a = _add(edge_a_start, _scale(edge_dir_a, offset))
             finger_origin_b = _add(edge_b_start, _scale(edge_dir_b, offset))
 
-            if idx % 2 == 0:
+            keep_a = (idx % 2 == 0)
+            if flip_phase:
+                keep_a = not keep_a
+
+            if keep_a:
                 # Even: Panel A keeps finger, Panel B gets slot cut
                 # Cut into panel B: a box that removes material from B
                 # The box sits at the shared edge and extends into B
