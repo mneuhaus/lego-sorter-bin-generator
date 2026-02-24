@@ -26,6 +26,7 @@ _JOB_LOCK = Lock()
 _JOB_INDEX: dict[str, dict[str, Any]] = {}
 _JOB_TTL_SECONDS = int(float(os.getenv("LASERCUT_WEB_JOB_TTL_SECONDS", "21600")))
 _JOB_MAX_WORKERS = max(1, int(float(os.getenv("LASERCUT_WEB_MAX_WORKERS", "4"))))
+_FIXED_PACK_ROTATIONS = 8
 
 
 def _repo_root() -> Path:
@@ -192,7 +193,6 @@ def _generate_single_file(
     sheet_height: float | None,
     part_gap: float,
     sheet_gap: float,
-    pack_rotations: int,
     job_dir: Path,
 ) -> dict[str, Any]:
     started = time.perf_counter()
@@ -224,7 +224,7 @@ def _generate_single_file(
             sheet_height=sheet_height,
             part_gap=part_gap,
             sheet_gap=sheet_gap,
-            pack_rotations=pack_rotations,
+            pack_rotations=_FIXED_PACK_ROTATIONS,
         )
 
         mesh = _mesh_from_step(step_path)
@@ -260,7 +260,6 @@ def _run_batch_generation(
     sheet_height: float | None,
     part_gap: float,
     sheet_gap: float,
-    pack_rotations: int,
 ) -> dict[str, Any]:
     _cleanup_expired_jobs()
 
@@ -300,7 +299,6 @@ def _run_batch_generation(
                 sheet_height=sheet_height,
                 part_gap=part_gap,
                 sheet_gap=sheet_gap,
-                pack_rotations=pack_rotations,
                 job_dir=job_dir,
             ): step_file
             for step_file in deduped
@@ -793,10 +791,6 @@ def _render_index(error: str | None = None) -> str:
                 <label class="label" for="sheet_gap">Sheet Gap (mm)</label>
                 <input id="sheet_gap" name="sheet_gap" type="number" min="0" step="0.1" value="20">
               </div>
-              <div>
-                <label class="label" for="pack_rotations">Pack Rotations</label>
-                <input id="pack_rotations" name="pack_rotations" type="number" min="1" step="1" value="8">
-              </div>
             </div>
           </div>
         </div>
@@ -1207,7 +1201,6 @@ def generate_batch(
     sheet_height: str | None = Form(None),
     part_gap: float = Form(4.0),
     sheet_gap: float = Form(20.0),
-    pack_rotations: int = Form(8),
 ) -> JSONResponse:
     if layout not in {"unfolded", "packed"}:
         raise HTTPException(status_code=400, detail="layout must be 'unfolded' or 'packed'")
@@ -1234,7 +1227,6 @@ def generate_batch(
         sheet_height=parsed_sheet_height,
         part_gap=part_gap,
         sheet_gap=sheet_gap,
-        pack_rotations=pack_rotations,
     )
     return JSONResponse(payload)
 
@@ -1284,7 +1276,6 @@ def generate_single_legacy(
     sheet_height: str | None = Form(None),
     part_gap: float = Form(4.0),
     sheet_gap: float = Form(20.0),
-    pack_rotations: int = Form(8),
 ) -> FileResponse:
     if layout not in {"unfolded", "packed"}:
         raise HTTPException(status_code=400, detail="layout must be 'unfolded' or 'packed'")
@@ -1311,7 +1302,6 @@ def generate_single_legacy(
         sheet_height=parsed_sheet_height,
         part_gap=part_gap,
         sheet_gap=sheet_gap,
-        pack_rotations=pack_rotations,
     )
 
     items = payload.get("items", [])
