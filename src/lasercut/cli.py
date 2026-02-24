@@ -22,6 +22,12 @@ def main():
     parser.add_argument("--thickness", type=float, default=3.2, help="Material thickness in mm")
     parser.add_argument("--finger-width", type=float, default=20.0, help="Target finger width in mm")
     parser.add_argument(
+        "--kerf",
+        type=float,
+        default=0.0,
+        help="Kerf compensation in mm (positive=tighter fit, negative=looser)",
+    )
+    parser.add_argument(
         "--layout",
         choices=["unfolded", "packed"],
         default="unfolded",
@@ -47,17 +53,25 @@ def main():
             parser.error("--sheet-width and --sheet-height must be > 0")
 
     original_model = load_step_panels(args.step_file, args.thickness)
-    model = apply_finger_joints(original_model, args.finger_width)
+    model = apply_finger_joints(original_model, args.finger_width, kerf=args.kerf)
 
-    os.makedirs(args.output, exist_ok=True)
-    name = os.path.splitext(os.path.basename(args.step_file))[0]
-    filename_parts = [name, args.layout, f"{_num_token(args.thickness)}mm"]
+    thickness_label = f"{_num_token(args.thickness)}mm"
+    kerf_label = f"k{_num_token(args.kerf)}mm"
     if args.layout == "packed":
         sw = int(round(args.sheet_width)) if args.sheet_width is not None else 0
         sh = int(round(args.sheet_height)) if args.sheet_height is not None else 0
+        folder_name = f"bins_{thickness_label}_{kerf_label}_{sw}x{sh}"
+    else:
+        folder_name = f"bins_{thickness_label}_{kerf_label}"
+
+    output_dir = os.path.join(args.output, folder_name)
+    os.makedirs(output_dir, exist_ok=True)
+    name = os.path.splitext(os.path.basename(args.step_file))[0]
+    filename_parts = [name, args.layout, thickness_label, kerf_label]
+    if args.layout == "packed":
         filename_parts.append(f"{sw}x{sh}")
     output_file = "-".join(filename_parts) + ".svg"
-    output_path = os.path.join(args.output, output_file)
+    output_path = os.path.join(output_dir, output_file)
     export_svg(
         model,
         output_path,

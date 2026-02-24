@@ -337,6 +337,7 @@ def _make_finger_joint_faces_safe(
 def _apply_finger_joints_cqwarehouse(
     model: BinModel,
     finger_width: float,
+    kerf: float = 0.0,
 ) -> BinModel:
     """Use cq_warehouse topology-aware finger joints when source solid is available."""
     if model.source_solid is None:
@@ -367,49 +368,53 @@ def _apply_finger_joints_cqwarehouse(
         joint_edges,
         material_thickness=model.thickness,
         target_finger_width=finger_width,
-        kerf_width=0.0,
+        kerf_width=kerf,
     )
     if not jointed_faces:
         raise RuntimeError("cq_warehouse returned no jointed faces")
 
     panels = _clone_panels(model.panels)
 
-    panel_reference: list[tuple[str, Panel, tuple[float, float, float]]] = []
+    panel_reference: list[tuple[str, Panel, tuple[float, float, float], float]] = []
     for name, panel in panels.items():
         if panel.outer_face is None:
             continue
         c = panel.outer_face.Center()
-        panel_reference.append((name, panel, (c.x, c.y, c.z)))
+        panel_reference.append((name, panel, (c.x, c.y, c.z), panel.outer_face.Area()))
 
+    # Build one-to-one mapping panel -> face.
+    used_faces: set[int] = set()
     matched_names: set[str] = set()
-    for face in jointed_faces:
-        fc = face.Center()
-        fn = face.normalAt(fc)
-        fn_t = (fn.x, fn.y, fn.z)
-        face_center = (fc.x, fc.y, fc.z)
-
-        best_name: str | None = None
+    for name, panel, ref_center, ref_area in panel_reference:
+        best_idx: int | None = None
         best_score = float("-inf")
-        for name, panel, ref_center in panel_reference:
-            if name in matched_names:
+        for idx, face in enumerate(jointed_faces):
+            if idx in used_faces:
+                continue
+            fc = face.Center()
+            fn = face.normalAt(fc)
+            fn_t = (fn.x, fn.y, fn.z)
+            normal_align = abs(_vec_dot(fn_t, panel.outer_normal))
+            if normal_align < 0.75:
                 continue
 
-            normal_dot = _vec_dot(fn_t, panel.outer_normal)
-            if normal_dot < 0.85:
-                continue
+            face_center = (fc.x, fc.y, fc.z)
             center_dist = _pt_dist(face_center, ref_center)
-            score = normal_dot * 1000.0 - center_dist
+            area_delta = abs(face.Area() - ref_area)
+            score = normal_align * 1000.0 - center_dist * 2.0 - area_delta * 0.15
             if score > best_score:
                 best_score = score
-                best_name = name
+                best_idx = idx
 
-        if best_name is None:
+        if best_idx is None:
             continue
 
-        base_panel = panels[best_name]
+        used_faces.add(best_idx)
+        face = jointed_faces[best_idx]
+        base_panel = panels[name]
         new_edges = _extract_outer_wire_edges(face)
         new_solid = _thicken_face_inward(face, base_panel.outer_normal, model.thickness)
-        panels[best_name] = Panel(
+        panels[name] = Panel(
             name=base_panel.name,
             solid=new_solid,
             outer_normal=base_panel.outer_normal,
@@ -418,7 +423,7 @@ def _apply_finger_joints_cqwarehouse(
             outer_face=face,
             outer_edges=new_edges,
         )
-        matched_names.add(best_name)
+        matched_names.add(name)
 
     if not matched_names:
         raise RuntimeError("cq_warehouse faces could not be matched back to panels")
@@ -435,6 +440,7 @@ def _apply_finger_joints_cqwarehouse(
                 corners,
                 model.thickness,
                 finger_width=finger_width,
+                kerf=kerf,
             )
 
     print(
@@ -807,6 +813,7 @@ def _apply_through_slot(
     corners: list[tuple[tuple[float, float, float], set[str]]],
     thickness: float,
     finger_width: float = 20.0,
+    kerf: float = 0.0,
 ) -> None:
     """Cut a through-slot in one panel and matching tabs on the other.
 
@@ -878,6 +885,9 @@ def _apply_through_slot(
         # Fallback to one continuous slot if lip-based segmentation is unavailable.
         slot_intervals = [(usable_start, usable_end)]
 
+    # Positive kerf compensation tightens fit: shrink slot/recess cut width.
+    cut_width = max(0.2, thickness - kerf)
+
     # Cut through-slot segments in the slot panel.
     solid_slot = _to_cuttable(slot_panel.solid)
     for lo, hi in slot_intervals:
@@ -891,7 +901,7 @@ def _apply_through_slot(
             y_dir=slot_in_plane,
             z_dir=into_slot,
             dx=slot_length,
-            dy=thickness,
+            dy=cut_width,
             dz=thickness * 2,  # overshoot to ensure full penetration
         )
         solid_slot = _to_cuttable(solid_slot.cut(slot_box))
@@ -945,7 +955,7 @@ def _apply_through_slot(
             y_dir=wall_in_plane,
             z_dir=into_wall,
             dx=cut_len,
-            dy=thickness,
+            dy=cut_width,
             dz=thickness * 2,
         )
         solid_wall = _to_cuttable(solid_wall.cut(recess_box))
@@ -953,7 +963,11 @@ def _apply_through_slot(
     wall_panel.solid = solid_wall
 
 
-def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel:
+def apply_finger_joints(
+    model: BinModel,
+    finger_width: float = 20.0,
+    kerf: float = 0.0,
+) -> BinModel:
     """Apply finger joints at all shared edges by boolean-cutting panel solids.
 
     For edge-joined panels (normal case):
@@ -966,11 +980,15 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
     - The inset wall panel is recessed between segments to form matching tabs
 
     Returns a new BinModel with modified panel solids.
+
+    Kerf sign convention:
+    - positive kerf => tighter fit (smaller slots / larger tabs)
+    - negative kerf => looser fit
     """
     # Prefer topology-aware jointing from cq_warehouse when a source solid exists.
     if model.source_solid is not None:
         try:
-            return _apply_finger_joints_cqwarehouse(model, finger_width)
+            return _apply_finger_joints_cqwarehouse(model, finger_width, kerf=kerf)
         except Exception as exc:
             print(f"  cq_warehouse fallback to custom joints ({exc})")
 
@@ -992,6 +1010,7 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
                 corners,
                 thickness,
                 finger_width=finger_width,
+                kerf=kerf,
             )
             continue
 
@@ -1032,6 +1051,8 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
         # Convert current solids to cq.Solid for boolean ops
         solid_a = _to_cuttable(pa.solid)
         solid_b = _to_cuttable(pb.solid)
+        # Positive kerf shrinks slot cuts for tighter press-fit.
+        slot_cut_width = max(0.2, thickness - kerf)
 
         for idx, (offset, fw) in enumerate(fingers):
             # Finger origins along each panel's projected edge.
@@ -1049,7 +1070,7 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
                     y_dir=into_b,
                     z_dir=in_plane_b,
                     dx=fw,
-                    dy=thickness,
+                    dy=slot_cut_width,
                     dz=thickness,
                 )
                 result = solid_b.cut(box)
@@ -1063,7 +1084,7 @@ def apply_finger_joints(model: BinModel, finger_width: float = 20.0) -> BinModel
                     y_dir=into_a,
                     z_dir=in_plane_a,
                     dx=fw,
-                    dy=thickness,
+                    dy=slot_cut_width,
                     dz=thickness,
                 )
                 result = solid_a.cut(box)
