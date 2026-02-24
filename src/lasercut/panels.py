@@ -242,23 +242,31 @@ def _name_panels(
     """Assign unique names to panels based on their normals and positions."""
     names: list[str] = []
     category_counts: dict[str, int] = {}
+    side_wall_total = sum(
+        1 for bd in bodies_data if _classify_panel(bd["outer_normal"]) == "side_wall"
+    )
 
     for bd in bodies_data:
         cat = _classify_panel(bd["outer_normal"])
         count = category_counts.get(cat, 0)
 
         if cat == "end_wall":
-            # Distinguish front vs back by Y position
+            # Distinguish front vs right/back by Y position.
+            # For single-side-wall bins, the side wall is the functional back wall
+            # (inset/lip wall), so the +Y end wall is the right wall.
             ny = bd["outer_normal"][1]
             if ny < 0:
                 name = "front_wall"
             else:
-                name = "back_wall"
+                name = "right_wall" if side_wall_total == 1 else "back_wall"
         elif cat == "bottom":
             name = "bottom" if count == 0 else f"bottom_{count}"
         elif cat == "side_wall":
-            nx = bd["outer_normal"][0]
-            name = "right_wall" if nx > 0 else "left_wall"
+            if side_wall_total == 1:
+                name = "back_wall"
+            else:
+                nx = bd["outer_normal"][0]
+                name = "right_wall" if nx > 0 else "left_wall"
         elif cat == "gusset":
             ny = bd["outer_normal"][1]
             if ny > 0.5:
