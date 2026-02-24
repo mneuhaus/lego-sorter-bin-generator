@@ -467,6 +467,7 @@ def _hinge_neighbor_transform(
     panel_map: dict[str, Panel2D],
     placed_outline: dict[str, list[tuple[float, float]]],
     placed_xform: dict[str, Affine2D],
+    seam_overlap: float = 1.0,
 ) -> tuple[list[tuple[float, float]], list[list[tuple[float, float]]], Affine2D] | None:
     cur_outline = placed_outline[current]
     cur_xform = placed_xform[current]
@@ -495,6 +496,13 @@ def _hinge_neighbor_transform(
     angle_nbr = math.atan2(se_nbr_dy, se_nbr_dx)
 
     out_n = _outward_normal_2d(cur_outline, se_svg_a, se_svg_b)
+    # For living-hinge pieces, pull the neighbor slightly into the current panel
+    # so the unfolded seam has controlled overlap. This compensates hinge radius
+    # length growth after bending.
+    target_mid = (
+        se_svg_mid[0] - out_n[0] * max(0.0, seam_overlap),
+        se_svg_mid[1] - out_n[1] * max(0.0, seam_overlap),
+    )
     align_rot = angle_svg - angle_nbr
     T_rot = Affine2D.from_rotation(align_rot)
     T_ref = Affine2D.from_reflection(angle_svg)
@@ -503,7 +511,7 @@ def _hinge_neighbor_transform(
 
     def _candidate(base: Affine2D) -> tuple[list[tuple[float, float]], list[list[tuple[float, float]]], Affine2D, tuple[float, float]]:
         xf_mid = base.apply(*se_nbr_mid)
-        T_trans = Affine2D.from_translation(se_svg_mid[0] - xf_mid[0], se_svg_mid[1] - xf_mid[1])
+        T_trans = Affine2D.from_translation(target_mid[0] - xf_mid[0], target_mid[1] - xf_mid[1])
         xform = T_trans.compose(base)
         final_outline = xform.apply_pts(nbr_p2d.outline)
         final_holes = [xform.apply_pts(h) for h in nbr_p2d.holes]
