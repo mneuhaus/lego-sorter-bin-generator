@@ -531,7 +531,8 @@ def _hinge_slots_for_seam(
     piece_poly,
     thickness: float,
 ) -> list[list[tuple[float, float]]]:
-    if Polygon is None:
+    """Return living-hinge cut lines as 2-point polylines (not rectangular holes)."""
+    if Polygon is None or LineString is None:
         return []
     if se.panel_a not in panel_map or se.panel_b not in panel_map:
         return []
@@ -561,18 +562,11 @@ def _hinge_slots_for_seam(
     # Fusion-style lattice parameters: staggered rows across a hinge band.
     band_half = max(3.2, thickness * 1.4)
     row_pitch = max(1.9, thickness * 0.6)
-    slot_width = max(0.55, min(1.1, thickness * 0.28))
     slot_len = max(7.5, thickness * 2.6)
     link_gap = max(1.6, thickness * 0.5)
-    end_margin = max(3.0, thickness * 0.85)
 
-    usable_start = end_margin
-    usable_end = seam_len - end_margin
-    if usable_end - usable_start <= slot_len:
-        return []
-
-    y_start = -band_half + slot_width * 0.5
-    y_end = band_half - slot_width * 0.5
+    y_start = -band_half
+    y_end = band_half
     if y_end <= y_start:
         return []
 
@@ -582,25 +576,80 @@ def _hinge_slots_for_seam(
     total_rows_span = (row_count - 1) * row_pitch
     y0 = -total_rows_span / 2.0
 
+    period = slot_len + link_gap
+    if period <= 1e-6:
+        return []
+
+    def _pattern_intervals(length: float, phase: float) -> list[tuple[float, float]]:
+        if length <= 1e-6:
+            return []
+        low_k = int(math.floor((phase - slot_len) / period)) - 1
+        high_k = int(math.ceil((length + phase) / period)) + 1
+        intervals: list[tuple[float, float]] = []
+        for k in range(low_k, high_k + 1):
+            start = k * period - phase
+            end = start + slot_len
+            lo = max(0.0, start)
+            hi = min(length, end)
+            if hi - lo >= 0.8:
+                intervals.append((lo, hi))
+        if not intervals:
+            return []
+        intervals.sort()
+        merged = [intervals[0]]
+        for lo, hi in intervals[1:]:
+            if lo <= merged[-1][1] + 1e-6:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+            else:
+                merged.append((lo, hi))
+        return merged
+
+    def _collect_segments(geom) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+        if geom is None:
+            return []
+        gtype = getattr(geom, "geom_type", "")
+        if gtype == "LineString":
+            coords = list(geom.coords)
+            if len(coords) >= 2:
+                return [((float(coords[0][0]), float(coords[0][1])), (float(coords[-1][0]), float(coords[-1][1])))]
+            return []
+        if gtype == "MultiLineString" or gtype == "GeometryCollection":
+            out: list[tuple[tuple[float, float], tuple[float, float]]] = []
+            for g in geom.geoms:
+                out.extend(_collect_segments(g))
+            return out
+        return []
+
     loops: list[list[tuple[float, float]]] = []
-    safe_poly = piece_poly.buffer(-0.08)
+    min_x, min_y, max_x, max_y = piece_poly.bounds
+    extend = math.hypot(max_x - min_x, max_y - min_y) + 10.0
+
     for row in range(row_count):
         y_off = y0 + row * row_pitch
-        phase = 0.0 if row % 2 == 0 else (slot_len + link_gap) * 0.5
-        x = usable_start + phase
-        while x + slot_len <= usable_end:
-            origin = (
-                a0[0] + t[0] * x + na[0] * (y_off - slot_width * 0.5),
-                a0[1] + t[1] * x + na[1] * (y_off - slot_width * 0.5),
-            )
-            rect = _rect_loop(origin, t, na, slot_len, slot_width)
-            try:
-                poly = Polygon(rect)
-                if poly.is_valid and poly.area > 1e-6 and safe_poly.contains(poly):
-                    loops.append(rect)
-            except Exception:
-                pass
-            x += slot_len + link_gap
+        phase = 0.0 if row % 2 == 0 else period * 0.5
+
+        p_start = (
+            mid[0] - t[0] * extend + na[0] * y_off,
+            mid[1] - t[1] * extend + na[1] * y_off,
+        )
+        p_end = (
+            mid[0] + t[0] * extend + na[0] * y_off,
+            mid[1] + t[1] * extend + na[1] * y_off,
+        )
+
+        row_line = LineString([p_start, p_end])
+        inside = piece_poly.intersection(row_line)
+        for s0, s1 in _collect_segments(inside):
+            seg_vec = (s1[0] - s0[0], s1[1] - s0[1])
+            seg_len = math.hypot(seg_vec[0], seg_vec[1])
+            if seg_len < 0.8:
+                continue
+
+            ux, uy = (seg_vec[0] / seg_len, seg_vec[1] / seg_len)
+            for lo, hi in _pattern_intervals(seg_len, phase):
+                a = (s0[0] + ux * lo, s0[1] + uy * lo)
+                b = (s0[0] + ux * hi, s0[1] + uy * hi)
+                loops.append([a, b])
 
     return loops
 
@@ -1564,6 +1613,14 @@ def export_svg(
                 ))
 
         for hole in holes:
+            if len(hole) == 2:
+                dwg.add(dwg.path(
+                    d=f"M {hole[0][0]:.4f},{hole[0][1]:.4f} L {hole[1][0]:.4f},{hole[1][1]:.4f}",
+                    stroke="#000000",
+                    stroke_width="0.1",
+                    fill="none",
+                ))
+                continue
             if len(hole) < 3:
                 continue
             h_parts = [f"M {hole[0][0]:.4f},{hole[0][1]:.4f}"]
