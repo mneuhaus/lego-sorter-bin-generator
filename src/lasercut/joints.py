@@ -3,6 +3,7 @@
 Supports two joint types:
 - **Finger joints** for edge-joined panels (shared edge runs along both panels' boundaries)
 - **Through-slots** for inset panels (shared edge cuts across one panel's face interior)
+- **Living-hinge slit cuts** for shallow non-bottom seams (default: angle < 45 deg)
 """
 
 from __future__ import annotations
@@ -354,6 +355,7 @@ def _apply_finger_joints_cqwarehouse(
     model: BinModel,
     finger_width: float,
     kerf: float = 0.0,
+    living_hinge_angle_threshold_deg: float = 45.0,
 ) -> BinModel:
     """Use cq_warehouse topology-aware finger joints when source solid is available."""
     if model.source_solid is None:
@@ -364,88 +366,96 @@ def _apply_finger_joints_cqwarehouse(
     except ImportError as exc:
         raise RuntimeError("cq_warehouse is not installed") from exc
 
-    # Classify seams first so inset seams can be treated as through-slots.
+    # Classify seams first so inset seams can be treated as through-slots and
+    # shallow non-bottom seams can be switched to living hinges.
     finger_seams: list[SharedEdge] = []
     through_slot_seams: list[tuple[SharedEdge, str]] = []
+    hinge_seams: list[SharedEdge] = []
     for se in model.shared_edges:
         jt, slot_panel = _classify_joint_type(se, model.panels)
         if jt == "through_slot" and slot_panel is not None:
             through_slot_seams.append((se, slot_panel))
+        elif jt == "finger" and _should_use_living_hinge(
+            se, model.panels, living_hinge_angle_threshold_deg
+        ):
+            hinge_seams.append(se)
         else:
             finger_seams.append(se)
 
-    source_solid = _to_cuttable(model.source_solid)
-    matched_edge_seams = _match_source_edges_for_shared_edges(source_solid, finger_seams)
-    joint_edges = [edge for edge, _ in matched_edge_seams]
-    seam_by_edge = {edge: se for edge, se in matched_edge_seams}
-    if not joint_edges:
-        raise RuntimeError("No source edges matched shared seams for cq_warehouse")
-
-    jointed_faces = _make_finger_joint_faces_safe(
-        source_solid,
-        joint_edges,
-        seam_by_edge=seam_by_edge,
-        material_thickness=model.thickness,
-        target_finger_width=finger_width,
-        kerf_width=kerf,
-    )
-    if not jointed_faces:
-        raise RuntimeError("cq_warehouse returned no jointed faces")
-
     panels = _clone_panels(model.panels)
-
-    panel_reference: list[tuple[str, Panel, tuple[float, float, float], float]] = []
-    for name, panel in panels.items():
-        if panel.outer_face is None:
-            continue
-        c = panel.outer_face.Center()
-        panel_reference.append((name, panel, (c.x, c.y, c.z), panel.outer_face.Area()))
-
-    # Build one-to-one mapping panel -> face.
-    used_faces: set[int] = set()
+    joint_edges: list[cq.Edge] = []
     matched_names: set[str] = set()
-    for name, panel, ref_center, ref_area in panel_reference:
-        best_idx: int | None = None
-        best_score = float("-inf")
-        for idx, face in enumerate(jointed_faces):
-            if idx in used_faces:
-                continue
-            fc = face.Center()
-            fn = face.normalAt(fc)
-            fn_t = (fn.x, fn.y, fn.z)
-            normal_align = abs(_vec_dot(fn_t, panel.outer_normal))
-            if normal_align < 0.75:
-                continue
 
-            face_center = (fc.x, fc.y, fc.z)
-            center_dist = _pt_dist(face_center, ref_center)
-            area_delta = abs(face.Area() - ref_area)
-            score = normal_align * 1000.0 - center_dist * 2.0 - area_delta * 0.15
-            if score > best_score:
-                best_score = score
-                best_idx = idx
+    if finger_seams:
+        source_solid = _to_cuttable(model.source_solid)
+        matched_edge_seams = _match_source_edges_for_shared_edges(source_solid, finger_seams)
+        joint_edges = [edge for edge, _ in matched_edge_seams]
+        seam_by_edge = {edge: se for edge, se in matched_edge_seams}
+        if not joint_edges:
+            raise RuntimeError("No source edges matched shared seams for cq_warehouse")
 
-        if best_idx is None:
-            continue
-
-        used_faces.add(best_idx)
-        face = jointed_faces[best_idx]
-        base_panel = panels[name]
-        new_edges = _extract_outer_wire_edges(face)
-        new_solid = _thicken_face_inward(face, base_panel.outer_normal, model.thickness)
-        panels[name] = Panel(
-            name=base_panel.name,
-            solid=new_solid,
-            outer_normal=base_panel.outer_normal,
-            width=base_panel.width,
-            height=base_panel.height,
-            outer_face=face,
-            outer_edges=new_edges,
+        jointed_faces = _make_finger_joint_faces_safe(
+            source_solid,
+            joint_edges,
+            seam_by_edge=seam_by_edge,
+            material_thickness=model.thickness,
+            target_finger_width=finger_width,
+            kerf_width=kerf,
         )
-        matched_names.add(name)
+        if not jointed_faces:
+            raise RuntimeError("cq_warehouse returned no jointed faces")
 
-    if not matched_names:
-        raise RuntimeError("cq_warehouse faces could not be matched back to panels")
+        panel_reference: list[tuple[str, Panel, tuple[float, float, float], float]] = []
+        for name, panel in panels.items():
+            if panel.outer_face is None:
+                continue
+            c = panel.outer_face.Center()
+            panel_reference.append((name, panel, (c.x, c.y, c.z), panel.outer_face.Area()))
+
+        # Build one-to-one mapping panel -> face.
+        used_faces: set[int] = set()
+        for name, panel, ref_center, ref_area in panel_reference:
+            best_idx: int | None = None
+            best_score = float("-inf")
+            for idx, face in enumerate(jointed_faces):
+                if idx in used_faces:
+                    continue
+                fc = face.Center()
+                fn = face.normalAt(fc)
+                fn_t = (fn.x, fn.y, fn.z)
+                normal_align = abs(_vec_dot(fn_t, panel.outer_normal))
+                if normal_align < 0.75:
+                    continue
+
+                face_center = (fc.x, fc.y, fc.z)
+                center_dist = _pt_dist(face_center, ref_center)
+                area_delta = abs(face.Area() - ref_area)
+                score = normal_align * 1000.0 - center_dist * 2.0 - area_delta * 0.15
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+
+            if best_idx is None:
+                continue
+
+            used_faces.add(best_idx)
+            face = jointed_faces[best_idx]
+            base_panel = panels[name]
+            new_edges = _extract_outer_wire_edges(face)
+            new_solid = _thicken_face_inward(face, base_panel.outer_normal, model.thickness)
+            panels[name] = Panel(
+                name=base_panel.name,
+                solid=new_solid,
+                outer_normal=base_panel.outer_normal,
+                width=base_panel.width,
+                height=base_panel.height,
+                outer_face=face,
+                outer_edges=new_edges,
+            )
+            matched_names.add(name)
+
+        if not matched_names:
+            raise RuntimeError("cq_warehouse faces could not be matched back to panels")
 
     corners = _find_corner_points(model.shared_edges)
 
@@ -463,6 +473,22 @@ def _apply_finger_joints_cqwarehouse(
                 kerf=kerf,
             )
 
+    hinge_slits = 0
+    if hinge_seams:
+        for se in hinge_seams:
+            angle = _seam_panel_angle_deg(se, panels)
+            print(
+                f"  Living-hinge: {se.panel_a}--{se.panel_b} "
+                f"(angle={angle:.1f} deg < {living_hinge_angle_threshold_deg:.1f})"
+            )
+            hinge_slits += _apply_living_hinge_on_seam(
+                se,
+                panels,
+                corners,
+                model.thickness,
+                kerf=kerf,
+            )
+
     trimmed_seams = _trim_side_wall_overhangs_against_back_wall(
         model.shared_edges,
         panels,
@@ -474,6 +500,7 @@ def _apply_finger_joints_cqwarehouse(
     print(
         f"  cq_warehouse: jointed {len(matched_names)} panels "
         f"from {len(joint_edges)} edges ({len(through_slot_seams)} through-slots, "
+        f"{len(hinge_seams)} living-hinge seams / {hinge_slits} slits, "
         f"{trimmed_seams} side-trimmed seams)"
     )
     return BinModel(
@@ -673,6 +700,39 @@ def _classify_joint_type(
     else:
         # Both on boundary (normal edge-join) or both interior (ambiguous -> finger)
         return ("finger", None)
+
+
+# ---------------------------------------------------------------------------
+# Shallow-angle living hinge selection
+# ---------------------------------------------------------------------------
+
+def _is_bottom_panel_name(name: str) -> bool:
+    return name == "bottom" or name.startswith("bottom_")
+
+
+def _seam_panel_angle_deg(se: SharedEdge, panels: dict[str, Panel]) -> float:
+    """Return acute angle between seam panels in degrees (0..90)."""
+    pa = panels[se.panel_a]
+    pb = panels[se.panel_b]
+    na = _normalize(pa.outer_normal)
+    nb = _normalize(pb.outer_normal)
+    d = max(-1.0, min(1.0, abs(_vec_dot(na, nb))))
+    return math.degrees(math.acos(d))
+
+
+def _should_use_living_hinge(
+    se: SharedEdge,
+    panels: dict[str, Panel],
+    angle_threshold_deg: float,
+) -> bool:
+    """True when a seam should be handled as living hinge instead of finger tabs."""
+    if angle_threshold_deg <= 0:
+        return False
+    if _is_bottom_panel_name(se.panel_a) or _is_bottom_panel_name(se.panel_b):
+        return False
+    if se.panel_a not in panels or se.panel_b not in panels:
+        return False
+    return _seam_panel_angle_deg(se, panels) < angle_threshold_deg
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +990,82 @@ def _trim_side_wall_overhangs_against_back_wall(
     return trimmed_count
 
 
+def _apply_living_hinge_on_seam(
+    se: SharedEdge,
+    panels: dict[str, Panel],
+    corners: list[tuple[tuple[float, float, float], set[str]]],
+    thickness: float,
+    kerf: float = 0.0,
+) -> int:
+    """Cut a slit pattern near the seam on both connected panels.
+
+    This intentionally replaces interlocking fingers on shallow-angle seams
+    with a flexible relief zone.
+    """
+    slit_count = 0
+    slit_width = max(0.8, min(1.4, thickness * 0.35))
+    bridge_width = max(1.8, thickness * 0.65)
+    slit_pitch = slit_width + bridge_width
+    slit_depth = max(6.0, thickness * 2.4)
+    seam_inset = max(0.6, thickness * 0.2)
+    end_margin = max(2.0, thickness * 0.75)
+
+    # Positive kerf means tighter fit generally. For hinge slits keep an almost
+    # neutral compensation to avoid over-weakening at high kerf values.
+    effective_slit_width = max(0.4, slit_width - max(0.0, kerf) * 0.25)
+
+    for panel_name in (se.panel_a, se.panel_b):
+        panel = panels.get(panel_name)
+        if panel is None:
+            continue
+
+        seam_start, seam_end = _project_edge_to_panel(se, panel)
+        seam_vec = _vec_sub(seam_end, seam_start)
+        seam_len = _vec_len(seam_vec)
+        if seam_len < 8.0:
+            continue
+
+        edge_dir = _normalize(seam_vec)
+        in_plane = _edge_inward_direction(panel, seam_start, seam_end)
+        into_panel = _normalize((
+            -panel.outer_normal[0],
+            -panel.outer_normal[1],
+            -panel.outer_normal[2],
+        ))
+
+        start_keepout, end_keepout = _corner_keepout_for_edge(se, corners, thickness)
+        usable_start = start_keepout + end_margin
+        usable_end = seam_len - end_keepout - end_margin
+        usable_len = usable_end - usable_start
+        if usable_len < max(10.0, slit_pitch * 1.2):
+            continue
+
+        n_slits = max(1, int((usable_len + bridge_width) / slit_pitch))
+        pattern_len = n_slits * effective_slit_width + (n_slits - 1) * bridge_width
+        base_offset = usable_start + max(0.0, (usable_len - pattern_len) / 2.0)
+
+        solid = _to_cuttable(panel.solid)
+        for i in range(n_slits):
+            offset = base_offset + i * slit_pitch
+            origin = _add(seam_start, _scale(edge_dir, offset))
+            origin = _add(origin, _scale(in_plane, seam_inset))
+            slit_box = _make_oriented_box(
+                origin=origin,
+                x_dir=edge_dir,
+                y_dir=in_plane,
+                z_dir=into_panel,
+                dx=effective_slit_width,
+                dy=slit_depth,
+                dz=thickness * 2.0,
+            )
+            solid = _to_cuttable(solid.cut(slit_box))
+            slit_count += 1
+
+        panel.solid = solid
+
+    return slit_count
+
+
 # ---------------------------------------------------------------------------
 # Main joint application
 # ---------------------------------------------------------------------------
@@ -1099,6 +1235,7 @@ def apply_finger_joints(
     model: BinModel,
     finger_width: float = 20.0,
     kerf: float = 0.0,
+    living_hinge_angle_threshold_deg: float = 45.0,
 ) -> BinModel:
     """Apply finger joints at all shared edges by boolean-cutting panel solids.
 
@@ -1111,6 +1248,10 @@ def apply_finger_joints(
     - The crossed panel gets one or more through-slot segments
     - The inset wall panel is recessed between segments to form matching tabs
 
+    For shallow non-bottom seams (angle between panel normals below threshold):
+    - Finger joints are skipped
+    - A living-hinge slit pattern is cut near the seam in both panels
+
     Returns a new BinModel with modified panel solids.
 
     Kerf sign convention:
@@ -1120,7 +1261,12 @@ def apply_finger_joints(
     # Prefer topology-aware jointing from cq_warehouse when a source solid exists.
     if model.source_solid is not None:
         try:
-            return _apply_finger_joints_cqwarehouse(model, finger_width, kerf=kerf)
+            return _apply_finger_joints_cqwarehouse(
+                model,
+                finger_width,
+                kerf=kerf,
+                living_hinge_angle_threshold_deg=living_hinge_angle_threshold_deg,
+            )
         except Exception as exc:
             print(f"  cq_warehouse fallback to custom joints ({exc})")
 
@@ -1128,6 +1274,7 @@ def apply_finger_joints(
     panels = _clone_panels(model.panels)
 
     corners = _find_corner_points(model.shared_edges)
+    hinge_seams: list[SharedEdge] = []
 
     for se in model.shared_edges:
         # Classify the joint type
@@ -1144,6 +1291,17 @@ def apply_finger_joints(
                 finger_width=finger_width,
                 kerf=kerf,
             )
+            continue
+
+        if joint_type == "finger" and _should_use_living_hinge(
+            se, panels, living_hinge_angle_threshold_deg
+        ):
+            angle = _seam_panel_angle_deg(se, panels)
+            print(
+                f"  Living-hinge: {se.panel_a}--{se.panel_b} "
+                f"(angle={angle:.1f} deg < {living_hinge_angle_threshold_deg:.1f})"
+            )
+            hinge_seams.append(se)
             continue
 
         # Standard finger joint
@@ -1224,6 +1382,15 @@ def apply_finger_joints(
 
         pa.solid = solid_a
         pb.solid = solid_b
+
+    for se in hinge_seams:
+        _apply_living_hinge_on_seam(
+            se,
+            panels,
+            corners,
+            thickness,
+            kerf=kerf,
+        )
 
     _trim_side_wall_overhangs_against_back_wall(
         model.shared_edges,

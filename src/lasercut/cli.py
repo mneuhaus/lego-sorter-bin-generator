@@ -22,6 +22,15 @@ def main():
     parser.add_argument("--thickness", type=float, default=3.2, help="Material thickness in mm")
     parser.add_argument("--finger-width", type=float, default=20.0, help="Target finger width in mm")
     parser.add_argument(
+        "--living-hinge-angle",
+        type=float,
+        default=45.0,
+        help=(
+            "Use living-hinge slits instead of fingers on non-bottom seams below this "
+            "angle in degrees (<= 0 disables)"
+        ),
+    )
+    parser.add_argument(
         "--kerf",
         type=float,
         default=0.0,
@@ -53,7 +62,12 @@ def main():
             parser.error("--sheet-width and --sheet-height must be > 0")
 
     original_model = load_step_panels(args.step_file, args.thickness)
-    model = apply_finger_joints(original_model, args.finger_width, kerf=args.kerf)
+    model = apply_finger_joints(
+        original_model,
+        args.finger_width,
+        kerf=args.kerf,
+        living_hinge_angle_threshold_deg=args.living_hinge_angle,
+    )
 
     thickness_label = f"{_num_token(args.thickness)}mm"
     kerf_label = f"k{_num_token(args.kerf)}mm"
