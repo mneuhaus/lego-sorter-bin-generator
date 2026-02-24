@@ -104,6 +104,42 @@ def _collapse_short_segments(
     return out
 
 
+def _filter_boundary_touching_holes(
+    outline: list[tuple[float, float]],
+    holes: list[list[tuple[float, float]]],
+    boundary_tol: float = 0.03,
+) -> list[list[tuple[float, float]]]:
+    """Drop degenerate inner loops that touch the outer boundary."""
+    if not holes:
+        return holes
+    if Polygon is None:
+        return holes
+    try:
+        outer_poly = Polygon(outline)
+        if not outer_poly.is_valid or outer_poly.area <= 0:
+            return holes
+    except Exception:
+        return holes
+
+    kept: list[list[tuple[float, float]]] = []
+    for hole in holes:
+        if len(hole) < 3:
+            continue
+        try:
+            hole_poly = Polygon(hole)
+            if not hole_poly.is_valid or hole_poly.area <= 0:
+                continue
+            # Keep only strict interior loops with measurable clearance.
+            if not outer_poly.contains(hole_poly):
+                continue
+            if outer_poly.exterior.distance(hole_poly) <= boundary_tol:
+                continue
+            kept.append(hole)
+        except Exception:
+            continue
+    return kept
+
+
 def _point_in_polygon(
     pt: tuple[float, float],
     poly: list[tuple[float, float]],
@@ -421,6 +457,7 @@ def _project_panel(
             for verts in hole_verts_3d
             if len(verts) >= 3
         ]
+        holes_2d = _filter_boundary_touching_holes(pts_2d, holes_2d)
         return Panel2D(
             name=name, outline=pts_2d, holes=holes_2d,
             u_axis=u, v_axis=v,
@@ -448,6 +485,7 @@ def _project_panel(
         for hole in holes_rot
         if len(hole) >= 3
     ]
+    holes_2d = _filter_boundary_touching_holes(pts_2d, holes_2d)
 
     # Rotated 3D axes:
     #   final_x = dot(P, u)*cos(-rot) - dot(P, v)*sin(-rot) - min_x

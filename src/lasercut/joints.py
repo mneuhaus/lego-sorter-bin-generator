@@ -308,9 +308,13 @@ def _make_finger_joint_faces_safe(
         reverse_align = False
         if seam_by_edge is not None and common_edge in seam_by_edge:
             se = seam_by_edge[common_edge]
-            # Keep this specific seam in the opposite phase to avoid a tiny
-            # corner part-finger that offsets the back_wall/right_wall mesh.
-            reverse_align = {se.panel_a, se.panel_b} == {"bottom", "back_wall"}
+            # Keep specific seams in opposite phase to avoid corner remnants
+            # where the back lip and side-wall seams converge.
+            reverse_align = {se.panel_a, se.panel_b} in (
+                {"bottom", "back_wall"},
+                {"right_wall", "back_wall"},
+                {"left_wall", "back_wall"},
+            )
 
         if reverse_align:
             if working_face_areas[primary_face_index] < working_face_areas[secondary_face_index]:
@@ -443,9 +447,10 @@ def _apply_finger_joints_cqwarehouse(
     if not matched_names:
         raise RuntimeError("cq_warehouse faces could not be matched back to panels")
 
+    corners = _find_corner_points(model.shared_edges)
+
     # Apply inset through-slots after face-based finger generation.
     if through_slot_seams:
-        corners = _find_corner_points(model.shared_edges)
         for se, slot_panel_name in through_slot_seams:
             print(f"  Through-slot: {se.panel_a}--{se.panel_b} (slot in {slot_panel_name})")
             _apply_through_slot(
@@ -458,9 +463,18 @@ def _apply_finger_joints_cqwarehouse(
                 kerf=kerf,
             )
 
+    trimmed_seams = _trim_side_wall_overhangs_against_back_wall(
+        model.shared_edges,
+        panels,
+        corners,
+        model.thickness,
+        kerf=kerf,
+    )
+
     print(
         f"  cq_warehouse: jointed {len(matched_names)} panels "
-        f"from {len(joint_edges)} edges ({len(through_slot_seams)} through-slots)"
+        f"from {len(joint_edges)} edges ({len(through_slot_seams)} through-slots, "
+        f"{trimmed_seams} side-trimmed seams)"
     )
     return BinModel(
         panels=panels,
@@ -830,6 +844,92 @@ def _inset_slot_intervals_from_lip(
     return clipped
 
 
+def _is_side_wall_name(name: str) -> bool:
+    return (
+        name == "right_wall"
+        or name == "left_wall"
+        or name.startswith("right_wall_")
+        or name.startswith("left_wall_")
+    )
+
+
+def _trim_side_wall_overhangs_against_back_wall(
+    shared_edges: list[SharedEdge],
+    panels: dict[str, Panel],
+    corners: list[tuple[tuple[float, float, float], set[str]]],
+    thickness: float,
+    kerf: float = 0.0,
+    end_trim: float = 3.5,
+) -> int:
+    """Trim side-wall seam ends on back-wall joints.
+
+    This removes tiny corner remnants created where the inset back lip extends
+    past the effective back-wall engagement zone.
+    """
+    if end_trim <= 0:
+        return 0
+
+    trimmed_count = 0
+    cut_width = max(0.2, thickness - kerf)
+
+    for se in shared_edges:
+        side_name: str | None = None
+        if _is_side_wall_name(se.panel_a) and se.panel_b == "back_wall":
+            side_name = se.panel_a
+        elif _is_side_wall_name(se.panel_b) and se.panel_a == "back_wall":
+            side_name = se.panel_b
+
+        if side_name is None or side_name not in panels:
+            continue
+
+        side_panel = panels[side_name]
+        seam_start, seam_end = _project_edge_to_panel(se, side_panel)
+        seam_vec = _vec_sub(seam_end, seam_start)
+        seam_len = _vec_len(seam_vec)
+        if seam_len < 2.0:
+            continue
+
+        trim_len = min(end_trim, seam_len * 0.3)
+        if trim_len < 0.6:
+            continue
+
+        start_keepout, end_keepout = _corner_keepout_for_edge(se, corners, thickness)
+        offsets: list[float] = []
+        if start_keepout > 0:
+            offsets.append(0.0)
+        if end_keepout > 0:
+            offsets.append(seam_len - trim_len)
+        if not offsets:
+            continue
+
+        edge_dir = _normalize(seam_vec)
+        in_plane = _edge_inward_direction(side_panel, seam_start, seam_end)
+        into_side = _normalize((
+            -side_panel.outer_normal[0],
+            -side_panel.outer_normal[1],
+            -side_panel.outer_normal[2],
+        ))
+
+        solid = _to_cuttable(side_panel.solid)
+        for offset in offsets:
+            origin = _add(seam_start, _scale(edge_dir, offset))
+            trim_box = _make_oriented_box(
+                origin=origin,
+                x_dir=edge_dir,
+                y_dir=in_plane,
+                z_dir=into_side,
+                dx=trim_len,
+                dy=cut_width,
+                dz=thickness * 2,
+            )
+            solid = _to_cuttable(solid.cut(trim_box))
+
+        side_panel.solid = solid
+        trimmed_count += 1
+
+    return trimmed_count
+
+
 # ---------------------------------------------------------------------------
 # Main joint application
 # ---------------------------------------------------------------------------
@@ -972,18 +1072,22 @@ def _apply_through_slot(
     ))
 
     solid_wall = _to_cuttable(wall_panel.solid)
+    boundary_overcut = 0.2
     for lo, hi in recess_intervals:
         cut_len = hi - lo
         if cut_len <= 0:
             continue
         cut_origin = _add(wall_start, _scale(wall_dir, lo))
+        # Nudge outward across the seam boundary to avoid zero-width skins that
+        # can otherwise show up as stray "inner hole" loops in 2D projection.
+        cut_origin = _add(cut_origin, _scale(wall_in_plane, -boundary_overcut))
         recess_box = _make_oriented_box(
             origin=cut_origin,
             x_dir=wall_dir,
             y_dir=wall_in_plane,
             z_dir=into_wall,
             dx=cut_len,
-            dy=cut_width,
+            dy=cut_width + 2.0 * boundary_overcut,
             dz=thickness * 2,
         )
         solid_wall = _to_cuttable(solid_wall.cut(recess_box))
@@ -1120,6 +1224,14 @@ def apply_finger_joints(
 
         pa.solid = solid_a
         pb.solid = solid_b
+
+    _trim_side_wall_overhangs_against_back_wall(
+        model.shared_edges,
+        panels,
+        corners,
+        thickness,
+        kerf=kerf,
+    )
 
     return BinModel(
         panels=panels,
