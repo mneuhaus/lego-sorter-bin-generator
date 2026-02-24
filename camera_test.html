@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Camera Angle Picker</title>
+<style>
+  body { margin: 0; background: #f4f3ef; font-family: 'JetBrains Mono', monospace; color: #2c2c2a; }
+  h1 { text-align: center; padding: 24px 0 8px; font-size: 18px; }
+  p.info { text-align: center; font-size: 13px; color: #8a8a86; margin: 0 0 16px; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; max-width: 1200px; margin: 0 auto; padding: 0 16px 32px; }
+  .card { background: #fff; border: 2px solid #dddcd8; border-radius: 10px; overflow: hidden; cursor: pointer; transition: border-color .2s, box-shadow .2s; }
+  .card:hover { border-color: #b0afab; box-shadow: 0 4px 16px rgba(0,0,0,.06); }
+  .card canvas { width: 100%; height: 260px; display: block; background: #f4f3ef; }
+  .card .label { padding: 10px 14px; font-size: 14px; font-weight: 600; border-top: 1px solid #dddcd8; }
+  .card .sub { padding: 0 14px 10px; font-size: 12px; color: #8a8a86; }
+  .loading { text-align: center; padding: 60px; font-size: 14px; color: #8a8a86; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+<h1>// kamera-winkel auswahl</h1>
+<p class="info">Echtes STEP-Modell: bin_third_center.step &mdash; CadQuery Z-up &rarr; Three.js Y-up korrigiert</p>
+<div id="loading" class="loading">Lade Mesh vom Server...</div>
+<div class="grid" id="grid" style="display:none"></div>
+<script>
+const views = [
+  { name: "A — Isometrisch klassisch", desc: "45° Ecke, leicht erhöht", pos: [2.0, 1.4, 2.0] },
+  { name: "B — Erhöht 3/4", desc: "Mehr in die Box schauen", pos: [1.8, 2.2, 1.8] },
+  { name: "C — Flach von Ecke", desc: "Augenhöhe, diagonal", pos: [2.5, 0.6, 2.5] },
+  { name: "D — Produktfoto", desc: "Leicht schräg, Katalog-Stil", pos: [1.2, 1.0, 2.8] },
+  { name: "E — Draufsicht schräg", desc: "Steil von oben, man sieht rein", pos: [1.0, 3.0, 1.0] },
+  { name: "F — Fast Vogelperspektive", desc: "Sehr steil, Box von oben", pos: [0.4, 3.5, 0.4] },
+  { name: "G — Seitlich erhöht", desc: "Seitenblick, leicht von oben", pos: [3.0, 1.5, 0.5] },
+  { name: "H — Front schräg", desc: "Frontal mit leichtem Winkel", pos: [0.3, 1.2, 3.0] },
+  { name: "I — Hoch seitlich", desc: "Steiler Seitenblick", pos: [2.5, 2.5, 0.8] },
+  { name: "J — Niedrig dramatisch", desc: "Froschperspektive, Ecke", pos: [2.0, 0.3, 2.0] },
+  { name: "K — Leicht erhöht Ecke", desc: "Sanfter Blick von oben", pos: [2.0, 1.8, 2.0] },
+  { name: "L — Schräg hinten", desc: "Rückseite, erhöht", pos: [-1.5, 1.8, -2.2] },
+];
+
+async function loadMesh() {
+  const resp = await fetch(`/api/step-preview/${encodeURIComponent('bin_third_center.step')}`);
+  const data = await resp.json();
+  return data.mesh;
+}
+
+function buildGeometry(meshData) {
+  const triCount = meshData.triangles.length;
+  const positions = new Float32Array(triCount * 9);
+  let ptr = 0;
+  for (const tri of meshData.triangles) {
+    const a = meshData.vertices[tri[0]];
+    const b = meshData.vertices[tri[1]];
+    const c = meshData.vertices[tri[2]];
+    positions[ptr++] = a[0]; positions[ptr++] = a[1]; positions[ptr++] = a[2];
+    positions[ptr++] = b[0]; positions[ptr++] = b[1]; positions[ptr++] = b[2];
+    positions[ptr++] = c[0]; positions[ptr++] = c[1]; positions[ptr++] = c[2];
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+function renderView(canvas, geometry, viewPos) {
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  const w = canvas.clientWidth || 380;
+  const h = 260;
+  renderer.setSize(w, h, false);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xf4f3ef);
+  const camera = new THREE.PerspectiveCamera(34, w / h, 0.1, 20000);
+
+  const group = new THREE.Group();
+  const solidMaterial = new THREE.MeshStandardMaterial({
+    color: 0xd8d4cc, metalness: 0.05, roughness: 0.8, side: THREE.DoubleSide,
+  });
+  const edgeGeometry = new THREE.EdgesGeometry(geometry, 22);
+  const edgeMaterial = new THREE.LineBasicMaterial({ color: 0xff6b2b });
+  group.add(new THREE.Mesh(geometry, solidMaterial));
+  group.add(new THREE.LineSegments(edgeGeometry, edgeMaterial));
+
+  // CadQuery uses Z-up, Three.js uses Y-up: rotate -90° around X
+  group.rotation.x = -Math.PI / 2;
+
+  scene.add(group);
+
+  // Compute bounding box AFTER rotation
+  const bbox = new THREE.Box3().setFromObject(group);
+  const center = bbox.getCenter(new THREE.Vector3());
+  group.position.set(-center.x, -center.y, -center.z);
+
+  const size = bbox.getSize(new THREE.Vector3());
+  const radius = Math.max(size.x, size.y, size.z) * 0.55;
+
+  camera.position.set(radius * viewPos[0], radius * viewPos[1], radius * viewPos[2]);
+  camera.lookAt(0, 0, 0);
+
+  scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+  const key = new THREE.DirectionalLight(0xffffff, 0.7);
+  key.position.set(2, 3, 1.5);
+  scene.add(key);
+  const rim = new THREE.DirectionalLight(0xffeedd, 0.3);
+  rim.position.set(-1.5, -1, -2);
+  scene.add(rim);
+
+  renderer.render(scene, camera);
+}
+
+(async () => {
+  try {
+    const meshData = await loadMesh();
+    const geometry = buildGeometry(meshData);
+
+    document.getElementById('loading').style.display = 'none';
+    const grid = document.getElementById('grid');
+    grid.style.display = 'grid';
+
+    for (const view of views) {
+      const card = document.createElement('div');
+      card.className = 'card';
+      const canvas = document.createElement('canvas');
+      card.appendChild(canvas);
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = view.name;
+      card.appendChild(label);
+      const sub = document.createElement('div');
+      sub.className = 'sub';
+      sub.textContent = view.desc;
+      card.appendChild(sub);
+      grid.appendChild(card);
+
+      renderView(canvas, geometry, view.pos);
+    }
+  } catch (e) {
+    document.getElementById('loading').textContent = 'Fehler beim Laden: ' + e.message;
+  }
+})();
+</script>
+</body>
+</html>

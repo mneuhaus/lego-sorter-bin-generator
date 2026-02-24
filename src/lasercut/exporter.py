@@ -1248,12 +1248,9 @@ def _sheet_origins(
 ) -> list[tuple[float, float]]:
     if n_sheets <= 0:
         return []
-    cols = max(1, math.ceil(math.sqrt(n_sheets)))
     origins: list[tuple[float, float]] = []
     for idx in range(n_sheets):
-        col = idx % cols
-        row = idx // cols
-        origins.append((col * (sheet_width + sheet_gap), row * (sheet_height + sheet_gap)))
+        origins.append((0, idx * (sheet_height + sheet_gap)))
     return origins
 
 
@@ -1570,7 +1567,7 @@ def export_svg(
                 size=(w, h),
                 fill="none",
                 stroke="#B9B9B9",
-                stroke_width="0.15",
+                stroke_width="0.5",
                 stroke_dasharray="2.0,1.5",
             ))
             dwg.add(dwg.text(
@@ -1593,7 +1590,7 @@ def export_svg(
         dwg.add(dwg.path(
             d=" ".join(d_parts),
             stroke="#000000",
-            stroke_width="0.1",
+            stroke_width="0.5",
             fill="none",
         ))
 
@@ -1614,7 +1611,7 @@ def export_svg(
                 dwg.add(dwg.path(
                     d=" ".join(r_parts),
                     stroke="#1BAA5C",
-                    stroke_width="0.12",
+                    stroke_width="0.4",
                     stroke_dasharray="2.0,1.6",
                     fill="none",
                     opacity="0.9",
@@ -1625,7 +1622,7 @@ def export_svg(
                 dwg.add(dwg.path(
                     d=f"M {hole[0][0]:.4f},{hole[0][1]:.4f} L {hole[1][0]:.4f},{hole[1][1]:.4f}",
                     stroke="#000000",
-                    stroke_width="0.1",
+                    stroke_width="0.5",
                     fill="none",
                 ))
                 continue
@@ -1638,7 +1635,7 @@ def export_svg(
             dwg.add(dwg.path(
                 d=" ".join(h_parts),
                 stroke="#000000",
-                stroke_width="0.1",
+                stroke_width="0.5",
                 fill="none",
             ))
 

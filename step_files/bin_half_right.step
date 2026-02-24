@@ -18,7 +18,7 @@ cturing Information (PMI)---4.0---2014-10-13''CAx-IF Rec.Pracs.---3D Tessellated
 /*preprocessor_version */
 /*originating_system */
 /*authorisation */
-FILE_NAME('/vol/tmp/translate-4561350583143254588/Part Studio 1 - bin_half_right_wall_right_b.step','2026-02-23T15:52:15',(''),(''),'ST-DEVELOPER v20','ONSHAPE BY PTC INC, 1.211','  ');
+FILE_NAME('/vol/tmp/translate-17327302509660720656/Part Studio 1 - bin_half_right.step','2026-02-24T08:21:40',(''),(''),'ST-DEVELOPER v20','ONSHAPE BY PTC INC, 1.211','  ');
 FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF { 1 0 10303 442 3 1 4 }'));
 ENDSEC;
 DATA;
@@ -824,9 +824,9 @@ SURFACE()
 #799=FILL_AREA_STYLE('',(#800));
 #800=FILL_AREA_STYLE_COLOUR('',#801);
 #801=COLOUR_RGB('',0.615686274509804,0.811764705882353,0.929411764705882);
-#802=MANIFOLD_SOLID_BREP('bin_half_right_wall_right_b',#793);
+#802=MANIFOLD_SOLID_BREP('bin_half_right',#793);
 #803=SHAPE_DEFINITION_REPRESENTATION(#1324,#804);
-#804=SHAPE_REPRESENTATION('bin_half_right_wall_right_b',(#805),#1319);
+#804=SHAPE_REPRESENTATION('bin_half_right',(#805),#1319);
 #805=AXIS2_PLACEMENT_3D('',#1058,#858,#859);
 #806=AXIS2_PLACEMENT_3D('',#1059,#860,#861);
 #807=AXIS2_PLACEMENT_3D('',#1073,#868,#869);
@@ -1345,7 +1345,7 @@ SURFACE()
 GEOMETRIC_REPRESENTATION_CONTEXT(3)
 GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#1320))
 GLOBAL_UNIT_ASSIGNED_CONTEXT((#1323,#1322,#1321))
-REPRESENTATION_CONTEXT('bin_half_right_wall_right_b','TOP_LEVEL_ASSEMBLY_PART')
+REPRESENTATION_CONTEXT('bin_half_right','TOP_LEVEL_ASSEMBLY_PART')
 );
 #1320=UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(2.1E-05),#1323,'DISTANCE_ACCURACY_VALUE','Maximum Tolerance applied to model');
 #1321=(
@@ -1368,7 +1368,7 @@ SI_UNIT($,.METRE.)
 #1326=PRODUCT_DEFINITION_CONTEXT('',#1333,'design');
 #1327=PRODUCT_DEFINITION_FORMATION_WITH_SPECIFIED_SOURCE('','',#1329,.NOT_KNOWN.);
 #1328=PRODUCT_RELATED_PRODUCT_CATEGORY('','',(#1329));
-#1329=PRODUCT('bin_half_right_wall_right_b','bin_half_right_wall_right_b','bin_half_right_wall_right_b',(#1331));
+#1329=PRODUCT('bin_half_right','bin_half_right','bin_half_right',(#1331));
 #1330=PRODUCT_CATEGORY('','');
 #1331=PRODUCT_CONTEXT('',#1333,'mechanical');
 #1332=APPLICATION_PROTOCOL_DEFINITION('international standard','ap242_managed_model_based_3d_engineering',2020,#1333);

@@ -18,6 +18,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 COPY src ./src
 COPY step_files ./step_files
+COPY camera_test.html ./camera_test.html
 
 RUN pip install --no-cache-dir uv \
     && uv sync --frozen --no-dev

@@ -914,7 +914,7 @@ def _trim_side_wall_overhangs_against_back_wall(
     kerf: float = 0.0,
     end_trim: float = 3.5,
 ) -> int:
-    """Trim side-wall seam ends on back-wall joints.
+    """Trim side-wall seam-end overhangs on back-wall joints.
 
     This removes tiny corner remnants created where the inset back lip extends
     past the effective back-wall engagement zone.

@@ -14,7 +14,7 @@ from threading import Lock
 from typing import Any
 
 import cadquery as cq
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from lasercut.exporter import export_svg
@@ -241,8 +241,6 @@ def _generate_single_file(
             pack_rotations=_FIXED_PACK_ROTATIONS,
         )
 
-        mesh = _mesh_from_step(step_path)
-
         elapsed = round(time.perf_counter() - started, 2)
         return {
             "step_file": step_file,
@@ -250,7 +248,6 @@ def _generate_single_file(
             "filename": filename,
             "folder_name": folder_name,
             "output_path": str(output_path),
-            "mesh": mesh,
             "elapsed_s": elapsed,
         }
     except Exception as exc:
@@ -362,7 +359,6 @@ def _run_batch_generation(
                 "elapsed_s": item.get("elapsed_s", 0.0),
                 "download_url": f"/api/jobs/{job_id}/files/{token}",
                 "preview_url": f"/api/jobs/{job_id}/files/{token}",
-                "mesh": item.get("mesh"),
             }
         )
 
@@ -408,14 +404,18 @@ def _get_job(job_id: str) -> dict[str, Any]:
 
 def _render_index(error: str | None = None) -> str:
     options: list[str] = []
-    for name in _available_step_files():
+    for i, name in enumerate(_available_step_files()):
         escaped = html.escape(name)
+        delay = f"animation-delay:{i * 0.04:.2f}s"
         options.append(
             "".join(
                 [
-                    '<label class="step-choice">',
+                    f'<label class="step-choice" style="{delay}">',
+                    f'<div class="step-thumb" data-step="{escaped}"><canvas></canvas></div>',
+                    '<div class="step-info">',
                     f'<input type="checkbox" name="step_files" value="{escaped}" checked>',
                     f"<span>{escaped}</span>",
+                    "</div>",
                     "</label>",
                 ]
             )
@@ -435,446 +435,524 @@ def _render_index(error: str | None = None) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Lego Sorter Bin Generator</title>
+  <title>lasercut-gen</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #f3f5f1;
-      --paper: #ffffff;
-      --ink: #162019;
-      --muted: #57645b;
-      --line: #cfd7d1;
-      --accent: #22613e;
-      --accent-soft: #e8f0ea;
-      --danger: #8a1d1d;
+      --bg: #f4f3ef;
+      --surface: #ffffff;
+      --surface-2: #f9f9f7;
+      --border: #e6e5e1;
+      --border-hi: #cdccc8;
+      --text: #1a1a1a;
+      --text-2: #6b6b6b;
+      --text-3: #a0a09c;
+      --accent: #ff6b2b;
+      --accent-hover: #e85d20;
+      --accent-dim: rgba(255,107,43,.07);
+      --accent-border: rgba(255,107,43,.22);
+      --danger: #e5484d;
+      --danger-dim: rgba(229,72,77,.05);
+      --mono: 'JetBrains Mono', 'SF Mono', monospace;
+      --sans: 'Manrope', system-ui, sans-serif;
+      --r: 10px;
+      --r-sm: 6px;
     }
-    * { box-sizing: border-box; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; }
     body {
-      margin: 0;
-      background: radial-gradient(1200px 600px at 0% -10%, #e8efe8 0%, var(--bg) 55%, #eef2ee 100%);
-      color: var(--ink);
-      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 15px;
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background-image: radial-gradient(circle, #cccbc7 0.6px, transparent 0.6px);
+      background-size: 20px 20px;
+      opacity: .45;
+      mask-image: radial-gradient(ellipse 80% 50% at 50% 0%, black, transparent);
+      -webkit-mask-image: radial-gradient(ellipse 80% 50% at 50% 0%, black, transparent);
+      pointer-events: none; z-index: 0;
     }
     .wrap {
-      max-width: 1280px;
-      margin: 22px auto 36px;
-      padding: 0 16px;
+      position: relative; z-index: 1;
+      max-width: 1320px;
+      margin: 0 auto;
+      padding: 28px 20px 56px;
+    }
+    .header {
+      display: flex; align-items: center; gap: 10px;
+      margin-bottom: 24px;
+    }
+    .header h1 {
+      font-family: var(--mono);
+      font-size: 18px; font-weight: 700;
+      color: var(--text);
+      letter-spacing: -.02em;
+    }
+    .header .tag {
+      font-family: var(--mono);
+      font-size: 11px; font-weight: 500;
+      color: var(--text-3);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      padding: 4px 12px;
+      letter-spacing: .02em;
     }
     .panel {
-      background: var(--paper);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 16px;
-      box-shadow: 0 14px 34px rgba(20, 30, 20, 0.08);
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.03), 0 6px 16px rgba(0,0,0,.03);
     }
-    .hidden { display: none; }
-    h1 {
-      margin: 0 0 6px;
-      font-size: 27px;
-      letter-spacing: .2px;
+    .panel + .panel { margin-top: 16px; }
+    .hidden { display: none !important; }
+    .section-label {
+      font-family: var(--mono);
+      font-size: 12px; font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: var(--text-3);
+      margin-bottom: 10px;
     }
-    .sub {
-      margin: 0 0 14px;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    .error {
-      margin: 0 0 10px;
+    p.error {
+      margin-bottom: 14px;
       color: var(--danger);
-      font-weight: 700;
+      font-family: var(--mono);
+      font-size: 13px;
+      background: var(--danger-dim);
+      border: 1px solid rgba(229,72,77,.15);
+      border-radius: var(--r-sm);
+      padding: 10px 14px;
     }
-    .grid {
+    .form-grid {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 12px;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
     }
-    .full { grid-column: 1 / -1; }
     label.label {
       display: block;
-      font-size: 12px;
-      font-weight: 700;
+      font-family: var(--mono);
+      font-size: 12px; font-weight: 500;
       text-transform: uppercase;
-      letter-spacing: .05em;
-      color: #2b352d;
-      margin-bottom: 6px;
+      letter-spacing: .06em;
+      color: var(--text-3);
+      margin-bottom: 5px;
     }
     input[type="number"], select {
       width: 100%;
-      border: 1px solid #c4cec6;
-      border-radius: 9px;
-      padding: 9px 10px;
-      background: #fff;
-      font-size: 14px;
-      color: var(--ink);
-    }
-    .step-box {
-      border: 1px dashed #c8d2ca;
-      border-radius: 12px;
-      background: #fbfcfa;
-      padding: 10px;
-    }
-    .origin-preview {
-      border: 1px solid #d2ddd4;
-      border-radius: 10px;
-      background: #f7faf7;
-      padding: 8px;
-      margin-bottom: 9px;
-    }
-    .origin-preview-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      align-items: center;
-      flex-wrap: wrap;
-      margin-bottom: 6px;
-      font-size: 12px;
-      color: #2a3a31;
-      font-weight: 700;
-    }
-    .origin-preview-name {
-      color: #3f5448;
-      font-weight: 600;
-      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-      font-size: 11px;
-      max-width: 100%;
-      overflow-wrap: anywhere;
-    }
-    .origin-preview-canvas {
-      border: 1px solid #d6e0d8;
+      border: 1.5px solid var(--border);
       border-radius: 8px;
-      background: #f0f5f1;
-      min-height: 240px;
-      height: 240px;
-      overflow: hidden;
-      position: relative;
+      padding: 9px 11px;
+      background: var(--surface);
+      font-family: var(--mono);
+      font-size: 14px;
+      color: var(--text);
+      outline: none;
+      transition: border-color .15s, box-shadow .15s;
     }
-    .origin-preview-canvas canvas {
-      width: 100%;
-      height: 100%;
-      display: block;
+    input[type="number"]:focus, select:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-dim);
     }
-    .origin-preview-note {
-      position: absolute;
-      left: 8px;
-      top: 8px;
-      font-size: 11px;
-      color: #52665b;
-      background: rgba(255, 255, 255, 0.86);
-      border: 1px solid #d7e1d9;
-      border-radius: 6px;
-      padding: 2px 6px;
-      pointer-events: none;
+    select { cursor: pointer; }
+    .step-section {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
     }
     .step-tools {
-      display: flex;
-      gap: 8px;
-      margin-bottom: 8px;
-      flex-wrap: wrap;
+      display: flex; gap: 6px; margin-bottom: 10px;
     }
     .tiny-btn {
-      border: 1px solid #bcc8bf;
-      background: #fff;
-      color: #213128;
-      border-radius: 8px;
-      font-size: 12px;
-      font-weight: 700;
-      padding: 6px 9px;
+      font-family: var(--mono);
+      font-size: 12px; font-weight: 600;
+      color: var(--text-2);
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 14px;
       cursor: pointer;
+      transition: all .15s;
     }
-    .tiny-btn:hover { background: #f5f8f5; }
+    .tiny-btn:hover { color: var(--text); border-color: var(--border-hi); background: #fff; }
     .step-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(185px, 1fr));
       gap: 8px;
-      max-height: 230px;
-      overflow: auto;
-      padding-right: 4px;
+    }
+    @keyframes cardIn {
+      from { opacity: 0; transform: translateY(5px) scale(.98); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
     }
     .step-choice {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      border: 1px solid #d6ddd7;
-      border-radius: 9px;
-      padding: 7px 8px;
-      background: #fff;
-      min-height: 36px;
-    }
-    .step-choice span {
-      font-size: 13px;
-      color: #243129;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .empty {
-      margin: 0;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .packed {
-      border: 1px dashed #ccd5ce;
-      border-radius: 11px;
-      padding: 10px;
-      background: #fafcf9;
-      display: none;
-    }
-    .packed.visible { display: block; }
-    .cta-row {
-      margin-top: 14px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .cta {
-      border: none;
-      border-radius: 10px;
-      padding: 10px 16px;
-      font-size: 14px;
-      font-weight: 800;
-      letter-spacing: .02em;
-      color: #fff;
-      background: linear-gradient(160deg, #2a7a4f 0%, #1f5f3d 100%);
-      cursor: pointer;
-    }
-    .cta[disabled] {
-      opacity: .65;
-      cursor: wait;
-    }
-    .status {
-      color: var(--muted);
-      font-size: 13px;
-      font-weight: 600;
-    }
-    .results-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-bottom: 8px;
-    }
-    .download-zip {
-      text-decoration: none;
-      border: 1px solid #b4c3b8;
-      background: var(--accent-soft);
-      color: #21462f;
+      display: flex; flex-direction: column;
+      border: 2px solid var(--border);
       border-radius: 8px;
-      padding: 7px 10px;
-      font-size: 13px;
-      font-weight: 800;
+      background: var(--surface);
+      overflow: hidden; cursor: pointer;
+      transition: border-color .2s, box-shadow .2s;
+      animation: cardIn .3s ease both;
     }
-    .results-grid {
-      margin-top: 10px;
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
-      gap: 12px;
+    .step-choice:hover {
+      border-color: var(--border-hi);
+      box-shadow: 0 2px 8px rgba(0,0,0,.05);
     }
-    .result-card {
-      border: 1px solid #d2dbd4;
-      border-radius: 12px;
-      background: #fff;
-      padding: 10px;
-      display: grid;
-      gap: 10px;
+    .step-choice:has(input:checked) {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-dim), 0 2px 8px rgba(255,107,43,.08);
     }
-    .result-card.error {
-      border-color: #ddb7b7;
-      background: #fff8f8;
-    }
-    .result-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      align-items: baseline;
-      flex-wrap: wrap;
-    }
-    .result-title {
-      font-weight: 800;
-      font-size: 14px;
-      color: #13231a;
-      overflow-wrap: anywhere;
-    }
-    .result-meta {
-      font-size: 12px;
-      color: var(--muted);
-    }
-    .download-one {
-      text-decoration: none;
-      font-size: 12px;
-      font-weight: 800;
-      color: #234f34;
-      border: 1px solid #b7c5ba;
-      border-radius: 7px;
-      padding: 5px 8px;
-      background: #f6faf7;
-    }
-    .viewer {
-      border: 1px solid #d5ded7;
-      border-radius: 10px;
-      background: #f5f8f5;
-      min-height: 220px;
-      height: 220px;
+    .step-thumb {
+      height: 130px;
+      background: var(--bg);
       position: relative;
-      overflow: hidden;
+      border-bottom: 1px solid var(--border);
     }
-    .viewer canvas {
-      width: 100%;
-      height: 100%;
-      display: block;
-    }
-    .viewer-note {
-      position: absolute;
-      left: 8px;
-      top: 8px;
-      font-size: 11px;
-      color: #516257;
-      background: rgba(255, 255, 255, 0.86);
-      border-radius: 6px;
-      padding: 2px 6px;
-      border: 1px solid #d7e0d9;
+    .step-thumb::before {
+      content: '';
+      position: absolute; inset: 0;
+      background-image: radial-gradient(circle, #c8c7c3 0.5px, transparent 0.5px);
+      background-size: 12px 12px;
+      opacity: .5;
       pointer-events: none;
     }
+    .step-thumb canvas {
+      position: relative; z-index: 1;
+      width: 100%; height: 100%; display: block;
+    }
+    .step-info {
+      display: flex; align-items: center; gap: 8px;
+      padding: 9px 10px;
+    }
+    .step-info input[type="checkbox"] {
+      appearance: none; -webkit-appearance: none;
+      width: 16px; height: 16px; flex-shrink: 0;
+      border: 2px solid var(--border-hi);
+      border-radius: 4px;
+      background: var(--surface);
+      cursor: pointer; position: relative;
+      transition: all .15s;
+    }
+    .step-info input[type="checkbox"]:checked {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .step-info input[type="checkbox"]:checked::after {
+      content: '';
+      position: absolute; left: 4px; top: 1.5px;
+      width: 5px; height: 8px;
+      border: solid #fff; border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    .step-choice span {
+      font-family: var(--mono);
+      font-size: 13px; color: var(--text-2);
+      overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; min-width: 0;
+      transition: color .15s;
+    }
+    .step-choice:has(input:checked) span { color: var(--text); font-weight: 500; }
+    .empty { color: var(--text-3); font-family: var(--mono); font-size: 13px; }
+    .packed-section {
+      margin-top: 12px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px;
+      display: none;
+    }
+    .packed-section.visible { display: block; }
+    .packed-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+    .cta-row {
+      margin-top: 20px;
+      display: flex; align-items: center; gap: 14px;
+    }
+    .cta {
+      font-family: var(--mono);
+      font-size: 14px; font-weight: 700;
+      color: #fff;
+      background: var(--accent);
+      border: none;
+      border-radius: 8px;
+      padding: 12px 30px;
+      cursor: pointer;
+      transition: all .15s;
+      letter-spacing: .01em;
+      box-shadow: 0 2px 8px rgba(255,107,43,.2);
+    }
+    .cta:hover {
+      background: var(--accent-hover);
+      box-shadow: 0 4px 20px rgba(255,107,43,.28);
+      transform: translateY(-1px);
+    }
+    .cta[disabled] { opacity: .5; cursor: wait; transform: none; box-shadow: none; }
+    .status { font-family: var(--mono); font-size: 13px; color: var(--text-3); }
+    .foot { margin-top: 16px; font-family: var(--mono); font-size: 12px; color: var(--text-3); }
+    .results-head {
+      display: flex; justify-content: space-between; align-items: center;
+      gap: 12px; flex-wrap: wrap; margin-bottom: 10px;
+    }
+    .results-head h2 {
+      font-family: var(--mono);
+      font-size: 16px; font-weight: 700;
+      color: var(--text);
+    }
+    .download-zip {
+      font-family: var(--mono);
+      font-size: 13px; font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-dim);
+      border: 1px solid var(--accent-border);
+      border-radius: var(--r-sm);
+      padding: 7px 14px;
+      text-decoration: none;
+      transition: all .15s;
+    }
+    .download-zip:hover { background: rgba(255,107,43,.12); border-color: var(--accent); }
+    .results-meta {
+      font-family: var(--mono);
+      font-size: 13px; color: var(--text-3);
+      margin-bottom: 12px;
+    }
+    .results-panel {
+      position: relative; z-index: 1;
+      margin: 16px 20px 56px;
+      border-radius: var(--r);
+    }
+    .results-grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    .result-card {
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      background: var(--surface);
+      padding: 16px; display: grid; gap: 12px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.02);
+    }
+    .result-card.error {
+      border-color: rgba(229,72,77,.2);
+      background: var(--danger-dim);
+    }
+    .result-head {
+      display: flex; justify-content: space-between;
+      gap: 10px; align-items: center; flex-wrap: wrap;
+    }
+    .result-title {
+      font-family: var(--mono);
+      font-size: 14px; font-weight: 600;
+      color: var(--text); overflow-wrap: anywhere;
+    }
+    .result-meta { font-family: var(--mono); font-size: 12px; color: var(--text-3); }
+    .download-one {
+      font-family: var(--mono);
+      font-size: 12px; font-weight: 600;
+      color: var(--accent);
+      border: 1px solid var(--accent-border);
+      background: var(--accent-dim);
+      border-radius: var(--r-sm);
+      padding: 5px 12px;
+      text-decoration: none;
+      transition: all .15s;
+    }
+    .download-one:hover { border-color: var(--accent); background: rgba(255,107,43,.12); }
+    .svg-wrap {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+      overflow: hidden;
+    }
+    .svg-inner { width: 100%; }
+    .svg-inner img {
+      display: block; width: 100%; height: auto;
+      filter: drop-shadow(0 0 0.6px #000) drop-shadow(0 0 0.6px #000) drop-shadow(0 0 0.6px #000);
+    }
     .svg-tools {
-      display: flex;
-      justify-content: flex-end;
-      align-items: center;
-      gap: 8px;
-      flex-wrap: wrap;
+      display: flex; justify-content: flex-end;
+      align-items: center; gap: 8px;
     }
     .svg-open {
-      font-size: 12px;
-      font-weight: 700;
-      color: #224f33;
-      text-decoration: none;
+      font-family: var(--mono);
+      font-size: 12px; color: var(--text-3);
+      text-decoration: none; transition: color .15s;
     }
-    .svg-wrap {
-      border: 1px solid #d3ddd5;
-      border-radius: 10px;
-      background: #f8faf8;
-      overflow: hidden;
+    .svg-open:hover { color: var(--text-2); }
+    .svg-modal-btn {
+      font-family: var(--mono);
+      font-size: 12px; font-weight: 600;
+      color: var(--text-2);
+      background: var(--surface-2);
+      border: 1.5px solid var(--border);
+      border-radius: var(--r-sm);
+      padding: 5px 14px;
+      cursor: pointer; transition: all .15s;
+    }
+    .svg-modal-btn:hover { color: var(--text); border-color: var(--border-hi); }
+    .modal-overlay {
+      position: fixed; inset: 0;
+      background: rgba(244,243,239,.9);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      z-index: 1000;
+      display: flex; align-items: center; justify-content: center;
+      padding: 28px;
+      animation: fadeIn .15s ease;
+    }
+    .modal-overlay.hidden { display: none; }
+    @keyframes fadeIn { from { opacity: 0 } to { opacity: 1 } }
+    .modal-content {
       position: relative;
-      padding: 8px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      max-width: 96vw; max-height: 94vh;
+      overflow: auto;
+      box-shadow: 0 24px 80px rgba(0,0,0,.12), 0 2px 6px rgba(0,0,0,.06);
     }
-    .svg-inner {
-      width: 100%;
+    .modal-close {
+      position: fixed; top: 16px; right: 20px;
+      width: 36px; height: 36px;
+      display: flex; align-items: center; justify-content: center;
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: 8px;
+      font-size: 16px; cursor: pointer;
+      color: var(--text-2); z-index: 1001;
+      transition: all .15s;
+      box-shadow: 0 2px 8px rgba(0,0,0,.06);
     }
-    .svg-inner img {
-      display: block;
-      width: 100%;
-      max-width: 100%;
-      height: auto;
-      border: 1px solid #e0e6e1;
-      background: #fff;
-    }
+    .modal-close:hover { color: var(--text); border-color: var(--border-hi); }
+    .modal-content img { display: block; width: 100%; height: auto; }
     .failure {
-      color: #7a1f1f;
-      font-size: 13px;
-      font-weight: 600;
-      line-height: 1.35;
+      font-family: var(--mono);
+      color: var(--danger);
+      font-size: 13px; line-height: 1.5;
       white-space: pre-wrap;
     }
-    .foot {
-      margin-top: 10px;
-      font-size: 12px;
-      color: var(--muted);
+    .result-card.loading { border-color: var(--border); }
+    .loading-skeleton {
+      height: 120px;
+      border-radius: 8px;
+      background: linear-gradient(90deg, var(--surface-2) 25%, #eeeee8 50%, var(--surface-2) 75%);
+      background-size: 200% 100%;
+      animation: shimmer 1.5s infinite;
+    }
+    @keyframes shimmer {
+      0% { background-position: 200% 0; }
+      100% { background-position: -200% 0; }
+    }
+    .result-card.loading .result-meta {
+      color: var(--accent);
     }
     @media (max-width: 900px) {
-      .grid { grid-template-columns: 1fr; }
-      .results-grid { grid-template-columns: 1fr; }
+      .form-grid { grid-template-columns: 1fr 1fr; }
+      .packed-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 600px) {
+      .form-grid, .packed-grid { grid-template-columns: 1fr; }
+      .step-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
     }
   </style>
 </head>
 <body>
   <div class="wrap">
+    <div class="header">
+      <h1>// lasercut-gen</h1>
+      <span class="tag">STEP &rarr; SVG</span>
+    </div>
+
     <section class="panel">
-      <h1>Lego Sorter Bin Generator</h1>
-      <p class="sub">Mehrere STEP-Varianten auswählen, parallel generieren, 3D/SVG prüfen und einzeln oder als ZIP herunterladen.</p>
       __ERROR_BLOCK__
       <form id="generate-form">
-        <div class="grid">
-          <div class="full">
-            <label class="label">STEP Files</label>
-            <div class="step-box">
-              <div class="origin-preview">
-                <div class="origin-preview-head">
-                  <span>Original STEP Vorschau (fester Blickwinkel)</span>
-                  <span id="origin-preview-name" class="origin-preview-name">Lade Vorschau ...</span>
-                </div>
-                <div class="origin-preview-canvas">
-                  <canvas id="origin-preview-canvas"></canvas>
-                  <div class="origin-preview-note">Originalmodell</div>
-                </div>
-              </div>
-              <div class="step-tools">
-                <button type="button" class="tiny-btn" id="select-all">Alle auswählen</button>
-                <button type="button" class="tiny-btn" id="select-none">Alle abwählen</button>
-              </div>
-              <div class="step-grid" id="step-grid">__STEP_OPTIONS__</div>
+        <div class="section-label">Models</div>
+        <div class="step-section">
+          <div class="step-tools">
+            <button type="button" class="tiny-btn" id="select-all">All</button>
+            <button type="button" class="tiny-btn" id="select-none">None</button>
+          </div>
+          <div class="step-grid" id="step-grid">__STEP_OPTIONS__</div>
+        </div>
+
+        <div style="margin-top:18px">
+          <div class="section-label">Parameters</div>
+          <div class="form-grid">
+            <div>
+              <label class="label" for="layout">Layout</label>
+              <select id="layout" name="layout">
+                <option value="packed" selected>packed</option>
+                <option value="unfolded">unfolded</option>
+              </select>
+            </div>
+            <div>
+              <label class="label" for="finger_width">Finger Width (mm)</label>
+              <input id="finger_width" name="finger_width" type="number" min="1" step="0.1" value="20.0">
+            </div>
+            <div>
+              <label class="label" for="thickness">Thickness (mm)</label>
+              <input id="thickness" name="thickness" type="number" min="0.1" step="0.01" value="3">
+            </div>
+            <div>
+              <label class="label" for="kerf">Kerf (mm)</label>
+              <input id="kerf" name="kerf" type="number" step="0.01" value="0.02">
             </div>
           </div>
+        </div>
 
-          <div>
-            <label class="label" for="layout">Layout</label>
-            <select id="layout" name="layout">
-              <option value="packed" selected>packed</option>
-              <option value="unfolded">unfolded</option>
-            </select>
-          </div>
-
-          <div>
-            <label class="label" for="finger_width">Finger Width (mm)</label>
-            <input id="finger_width" name="finger_width" type="number" min="1" step="0.1" value="20.0">
-          </div>
-
-          <div>
-            <label class="label" for="thickness">Thickness (mm)</label>
-            <input id="thickness" name="thickness" type="number" min="0.1" step="0.01" value="3.2">
-          </div>
-
-          <div>
-            <label class="label" for="kerf">Kerf (mm)</label>
-            <input id="kerf" name="kerf" type="number" step="0.01" value="0.02">
-          </div>
-
-          <div id="packed-block" class="packed full">
-            <div class="grid">
-              <div>
-                <label class="label" for="sheet_width">Sheet Width (mm)</label>
-                <input id="sheet_width" name="sheet_width" type="number" min="1" step="1" value="710">
-              </div>
-              <div>
-                <label class="label" for="sheet_height">Sheet Height (mm)</label>
-                <input id="sheet_height" name="sheet_height" type="number" min="1" step="1" value="180">
-              </div>
-              <div>
-                <label class="label" for="part_gap">Part Gap (mm)</label>
-                <input id="part_gap" name="part_gap" type="number" min="0" step="0.1" value="4">
-              </div>
-              <div>
-                <label class="label" for="sheet_gap">Sheet Gap (mm)</label>
-                <input id="sheet_gap" name="sheet_gap" type="number" min="0" step="0.1" value="20">
-              </div>
+        <div id="packed-block" class="packed-section">
+          <div class="section-label">Sheet</div>
+          <div class="packed-grid">
+            <div>
+              <label class="label" for="sheet_width">Width (mm)</label>
+              <input id="sheet_width" name="sheet_width" type="number" min="1" step="1" value="600">
+            </div>
+            <div>
+              <label class="label" for="sheet_height">Height (mm)</label>
+              <input id="sheet_height" name="sheet_height" type="number" min="1" step="1" value="400">
+            </div>
+            <div>
+              <label class="label" for="part_gap">Part Gap (mm)</label>
+              <input id="part_gap" name="part_gap" type="number" min="0" step="0.1" value="4">
+            </div>
+            <div>
+              <label class="label" for="sheet_gap">Sheet Gap (mm)</label>
+              <input id="sheet_gap" name="sheet_gap" type="number" min="0" step="0.1" value="20">
             </div>
           </div>
         </div>
 
         <div class="cta-row">
-          <button id="generate-btn" class="cta" type="submit">Parallel Generieren</button>
-          <span id="status" class="status">Bereit.</span>
+          <button id="generate-btn" class="cta" type="submit">Generate</button>
+          <span id="status" class="status">Bereit</span>
         </div>
       </form>
-      <p class="foot">Hinweis: Jobs werden serverseitig temporär gespeichert und nach einigen Stunden automatisch entfernt.</p>
+      <p class="foot">Jobs are stored temporarily and removed automatically after a few hours.</p>
     </section>
 
-    <section id="results-panel" class="panel hidden" style="margin-top: 14px;">
-      <div class="results-head">
-        <h2 style="margin:0;font-size:22px;">Ergebnisse</h2>
-        <div id="zip-slot"></div>
-      </div>
-      <p id="results-meta" class="sub" style="margin-bottom: 0;"></p>
-      <div id="results-grid" class="results-grid"></div>
-    </section>
+  </div>
+
+  <section id="results-panel" class="panel results-panel hidden">
+    <div class="results-head">
+      <h2>// results</h2>
+      <div id="zip-slot"></div>
+    </div>
+    <p id="results-meta" class="results-meta"></p>
+    <div id="results-grid" class="results-grid"></div>
+  </section>
+
+  <div id="svg-modal" class="modal-overlay hidden">
+    <button class="modal-close" id="modal-close-btn">&#x2715;</button>
+    <div class="modal-content">
+      <img id="svg-modal-img" src="" alt="SVG Preview">
+    </div>
   </div>
 
   <script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
@@ -890,10 +968,10 @@ def _render_index(error: str | None = None) -> str:
     const zipSlot = document.getElementById('zip-slot');
     const selectAllBtn = document.getElementById('select-all');
     const selectNoneBtn = document.getElementById('select-none');
-    const originPreviewCanvas = document.getElementById('origin-preview-canvas');
-    const originPreviewName = document.getElementById('origin-preview-name');
+    const svgModal = document.getElementById('svg-modal');
+    const svgModalImg = document.getElementById('svg-modal-img');
+    const modalCloseBtn = document.getElementById('modal-close-btn');
     const stepPreviewCache = new Map();
-    let activePreviewStepFile = null;
     const stepCheckboxes = Array.from(document.querySelectorAll('input[name="step_files"]'));
     const SETTINGS_KEY = 'lasercut.web.settings.v1';
     const fingerWidthInput = document.getElementById('finger_width');
@@ -1002,23 +1080,20 @@ def _render_index(error: str | None = None) -> str:
     function drawMeshUnavailable(canvas, message) {
       clearViewer(canvas);
       const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        return;
-      }
+      if (!ctx) return;
       const w = canvas.clientWidth || 400;
-      const h = canvas.clientHeight || 220;
-      canvas.width = w;
-      canvas.height = h;
-      ctx.fillStyle = '#f5f8f5';
+      const h = canvas.clientHeight || 130;
+      canvas.width = w; canvas.height = h;
+      ctx.fillStyle = '#f4f3ef';
       ctx.fillRect(0, 0, w, h);
-      ctx.fillStyle = '#607063';
-      ctx.font = '13px Segoe UI';
-      ctx.fillText(message, 14, 24);
+      ctx.fillStyle = '#a0a09c';
+      ctx.font = '13px JetBrains Mono, monospace';
+      ctx.fillText(message, 12, 22);
     }
 
     function initFixedMeshViewer(canvas, meshData) {
       if (!window.THREE || !meshData || !meshData.vertices || !meshData.triangles || meshData.triangles.length === 0) {
-        drawMeshUnavailable(canvas, 'Original 3D preview unavailable');
+        drawMeshUnavailable(canvas, 'no preview');
         return;
       }
 
@@ -1028,7 +1103,7 @@ def _render_index(error: str | None = None) -> str:
       renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
 
       const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0xf5f8f5);
+      scene.background = new THREE.Color(0xf4f3ef);
       const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 20000);
 
       const triCount = meshData.triangles.length;
@@ -1050,34 +1125,36 @@ def _render_index(error: str | None = None) -> str:
 
       const group = new THREE.Group();
       const solidMaterial = new THREE.MeshStandardMaterial({
-        color: 0xd7e6da,
+        color: 0xd8d4cc,
         metalness: 0.05,
-        roughness: 0.86,
+        roughness: 0.8,
         side: THREE.DoubleSide,
       });
       const edgeGeometry = new THREE.EdgesGeometry(geometry, 22);
-      const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x2c6848 });
+      const edgeMaterial = new THREE.LineBasicMaterial({ color: 0xff6b2b });
       const solid = new THREE.Mesh(geometry, solidMaterial);
       const wire = new THREE.LineSegments(edgeGeometry, edgeMaterial);
       group.add(solid);
       group.add(wire);
+      // CadQuery uses Z-up, Three.js uses Y-up
+      group.rotation.x = -Math.PI / 2;
       scene.add(group);
 
-      const bbox = new THREE.Box3().setFromObject(solid);
+      const bbox = new THREE.Box3().setFromObject(group);
       const center = bbox.getCenter(new THREE.Vector3());
       group.position.set(-center.x, -center.y, -center.z);
 
       const size = bbox.getSize(new THREE.Vector3());
       const radius = Math.max(size.x, size.y, size.z) * 0.55 || 1;
-      camera.position.set(radius * 2.2, radius * 1.55, radius * 2.2);
+      camera.position.set(radius * 2.0, radius * 1.4, radius * 2.0);
       camera.lookAt(0, 0, 0);
 
-      scene.add(new THREE.AmbientLight(0xffffff, 0.72));
-      const key = new THREE.DirectionalLight(0xffffff, 0.58);
-      key.position.set(1.8, 2.2, 1.4);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.5));
+      const key = new THREE.DirectionalLight(0xffffff, 0.7);
+      key.position.set(2, 3, 1.5);
       scene.add(key);
-      const rim = new THREE.DirectionalLight(0xffffff, 0.33);
-      rim.position.set(-1.1, -0.8, -1.4);
+      const rim = new THREE.DirectionalLight(0xffeedd, 0.3);
+      rim.position.set(-1.5, -1, -2);
       scene.add(rim);
 
       const render = () => {
@@ -1134,40 +1211,32 @@ def _render_index(error: str | None = None) -> str:
       return mesh;
     }
 
-    async function renderOriginPreview(stepFile) {
-      activePreviewStepFile = stepFile;
-      if (!stepFile) {
-        originPreviewName.textContent = 'Keine Auswahl';
-        drawMeshUnavailable(originPreviewCanvas, 'Keine STEP-Datei ausgewahlt');
-        return;
-      }
-
-      originPreviewName.textContent = `${stepFile} (lade ...)`;
-      try {
-        const mesh = await fetchStepPreviewMesh(stepFile);
-        if (activePreviewStepFile !== stepFile) {
-          return;
+    async function initStepThumbnails() {
+      const thumbs = document.querySelectorAll('.step-thumb[data-step]');
+      const promises = Array.from(thumbs).map(async (thumb) => {
+        const stepFile = thumb.getAttribute('data-step');
+        const canvas = thumb.querySelector('canvas');
+        if (!stepFile || !canvas) return;
+        try {
+          const mesh = await fetchStepPreviewMesh(stepFile);
+          initFixedMeshViewer(canvas, mesh);
+        } catch (_) {
+          drawMeshUnavailable(canvas, 'preview unavailable');
         }
-        originPreviewName.textContent = stepFile;
-        initFixedMeshViewer(originPreviewCanvas, mesh);
-      } catch (error) {
-        if (activePreviewStepFile !== stepFile) {
-          return;
-        }
-        originPreviewName.textContent = `${stepFile} (Vorschau fehlgeschlagen)`;
-        drawMeshUnavailable(originPreviewCanvas, 'Original 3D preview unavailable');
-      }
+      });
+      await Promise.all(promises);
     }
 
-    function updateOriginPreview(preferredFile = null) {
-      const chosen = selectedFiles();
-      let target = null;
-      if (preferredFile && chosen.includes(preferredFile)) {
-        target = preferredFile;
-      } else if (chosen.length > 0) {
-        target = chosen[0];
-      }
-      void renderOriginPreview(target);
+    function openSvgModal(url) {
+      svgModalImg.src = url;
+      svgModal.classList.remove('hidden');
+      document.body.style.overflow = 'hidden';
+    }
+
+    function closeSvgModal() {
+      svgModal.classList.add('hidden');
+      svgModalImg.src = '';
+      document.body.style.overflow = '';
     }
 
     function buildErrorCard(item) {
@@ -1181,7 +1250,7 @@ def _render_index(error: str | None = None) -> str:
       title.textContent = item.step_file;
       const meta = document.createElement('div');
       meta.className = 'result-meta';
-      meta.textContent = `fehlgeschlagen in ${Number(item.elapsed_s || 0).toFixed(2)}s`;
+      meta.textContent = `failed in ${Number(item.elapsed_s || 0).toFixed(2)}s`;
       head.appendChild(title);
       head.appendChild(meta);
 
@@ -1192,142 +1261,6 @@ def _render_index(error: str | None = None) -> str:
       card.appendChild(head);
       card.appendChild(err);
       return card;
-    }
-
-    function initMeshViewer(canvas, meshData) {
-      if (!window.THREE || !meshData || !meshData.vertices || !meshData.triangles || meshData.triangles.length === 0) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          const w = canvas.clientWidth || 400;
-          const h = canvas.clientHeight || 220;
-          canvas.width = w;
-          canvas.height = h;
-          ctx.fillStyle = '#f5f8f5';
-          ctx.fillRect(0, 0, w, h);
-          ctx.fillStyle = '#607063';
-          ctx.font = '13px Segoe UI';
-          ctx.fillText('3D preview unavailable', 14, 24);
-        }
-        return;
-      }
-
-      const THREE = window.THREE;
-      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
-
-      const scene = new THREE.Scene();
-      scene.background = new THREE.Color(0xf5f8f5);
-
-      const camera = new THREE.PerspectiveCamera(36, 1, 0.1, 20000);
-
-      const triCount = meshData.triangles.length;
-      const positions = new Float32Array(triCount * 9);
-      let ptr = 0;
-
-      for (const tri of meshData.triangles) {
-        const a = meshData.vertices[tri[0]];
-        const b = meshData.vertices[tri[1]];
-        const c = meshData.vertices[tri[2]];
-        positions[ptr++] = a[0]; positions[ptr++] = a[1]; positions[ptr++] = a[2];
-        positions[ptr++] = b[0]; positions[ptr++] = b[1]; positions[ptr++] = b[2];
-        positions[ptr++] = c[0]; positions[ptr++] = c[1]; positions[ptr++] = c[2];
-      }
-
-      const geometry = new THREE.BufferGeometry();
-      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-      geometry.computeVertexNormals();
-
-      const group = new THREE.Group();
-      const solid = new THREE.Mesh(
-        geometry,
-        new THREE.MeshStandardMaterial({
-          color: 0xd7e6da,
-          metalness: 0.05,
-          roughness: 0.86,
-          side: THREE.DoubleSide,
-        })
-      );
-      const wire = new THREE.LineSegments(
-        new THREE.EdgesGeometry(geometry, 22),
-        new THREE.LineBasicMaterial({ color: 0x2c6848 })
-      );
-      group.add(solid);
-      group.add(wire);
-      scene.add(group);
-
-      const bbox = new THREE.Box3().setFromObject(solid);
-      const center = bbox.getCenter(new THREE.Vector3());
-      group.position.set(-center.x, -center.y, -center.z);
-
-      const size = bbox.getSize(new THREE.Vector3());
-      const radius = Math.max(size.x, size.y, size.z) * 0.55 || 1;
-      camera.position.set(radius * 2.1, radius * 1.45, radius * 2.1);
-      camera.lookAt(0, 0, 0);
-
-      scene.add(new THREE.AmbientLight(0xffffff, 0.72));
-      const key = new THREE.DirectionalLight(0xffffff, 0.58);
-      key.position.set(1.8, 2.2, 1.4);
-      scene.add(key);
-      const rim = new THREE.DirectionalLight(0xffffff, 0.33);
-      rim.position.set(-1.1, -0.8, -1.4);
-      scene.add(rim);
-
-      let dragging = false;
-      let lastX = 0;
-      let lastY = 0;
-
-      canvas.addEventListener('pointerdown', (event) => {
-        dragging = true;
-        lastX = event.clientX;
-        lastY = event.clientY;
-        canvas.setPointerCapture(event.pointerId);
-      });
-
-      canvas.addEventListener('pointermove', (event) => {
-        if (!dragging) return;
-        const dx = event.clientX - lastX;
-        const dy = event.clientY - lastY;
-        lastX = event.clientX;
-        lastY = event.clientY;
-        group.rotation.y += dx * 0.011;
-        group.rotation.x += dy * 0.009;
-      });
-
-      canvas.addEventListener('pointerup', (event) => {
-        dragging = false;
-        try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
-      });
-
-      canvas.addEventListener('pointerleave', () => {
-        dragging = false;
-      });
-
-      canvas.addEventListener('wheel', (event) => {
-        event.preventDefault();
-        const factor = event.deltaY > 0 ? 1.08 : 0.92;
-        camera.position.multiplyScalar(factor);
-      }, { passive: false });
-
-      const resize = () => {
-        const w = Math.max(10, canvas.clientWidth);
-        const h = Math.max(10, canvas.clientHeight);
-        renderer.setSize(w, h, false);
-        camera.aspect = w / h;
-        camera.updateProjectionMatrix();
-      };
-
-      const observer = new ResizeObserver(resize);
-      observer.observe(canvas);
-      resize();
-
-      function frame() {
-        if (!dragging) {
-          group.rotation.y += 0.0025;
-        }
-        renderer.render(scene, camera);
-        window.requestAnimationFrame(frame);
-      }
-      frame();
     }
 
     function buildSuccessCard(item) {
@@ -1354,33 +1287,12 @@ def _render_index(error: str | None = None) -> str:
       dl.className = 'download-one';
       dl.href = item.download_url;
       dl.download = item.filename;
-      dl.textContent = 'Einzeln laden';
+      dl.textContent = 'Download';
 
       right.appendChild(meta);
       right.appendChild(dl);
       head.appendChild(title);
       head.appendChild(right);
-
-      const viewer = document.createElement('div');
-      viewer.className = 'viewer';
-      const note = document.createElement('div');
-      note.className = 'viewer-note';
-      note.textContent = '3D box preview · ziehen zum drehen · Mausrad zoom';
-      const canvas = document.createElement('canvas');
-      viewer.appendChild(canvas);
-      viewer.appendChild(note);
-
-      const svgTools = document.createElement('div');
-      svgTools.className = 'svg-tools';
-
-      const open = document.createElement('a');
-      open.className = 'svg-open';
-      open.href = item.preview_url;
-      open.target = '_blank';
-      open.rel = 'noreferrer';
-      open.textContent = 'SVG in neuem Tab';
-
-      svgTools.appendChild(open);
 
       const svgWrap = document.createElement('div');
       svgWrap.className = 'svg-wrap';
@@ -1393,12 +1305,27 @@ def _render_index(error: str | None = None) -> str:
       svgInner.appendChild(svgImg);
       svgWrap.appendChild(svgInner);
 
-      card.appendChild(head);
-      card.appendChild(viewer);
-      card.appendChild(svgTools);
-      card.appendChild(svgWrap);
+      const svgTools = document.createElement('div');
+      svgTools.className = 'svg-tools';
 
-      initMeshViewer(canvas, item.mesh);
+      const modalBtn = document.createElement('button');
+      modalBtn.className = 'svg-modal-btn';
+      modalBtn.textContent = 'Enlarge';
+      modalBtn.addEventListener('click', () => openSvgModal(item.preview_url));
+
+      const open = document.createElement('a');
+      open.className = 'svg-open';
+      open.href = item.preview_url;
+      open.target = '_blank';
+      open.rel = 'noreferrer';
+      open.textContent = 'Open SVG';
+
+      svgTools.appendChild(modalBtn);
+      svgTools.appendChild(open);
+
+      card.appendChild(head);
+      card.appendChild(svgWrap);
+      card.appendChild(svgTools);
 
       return card;
     }
@@ -1412,11 +1339,11 @@ def _render_index(error: str | None = None) -> str:
         const zip = document.createElement('a');
         zip.className = 'download-zip';
         zip.href = payload.zip_url;
-        zip.textContent = 'ZIP herunterladen';
+        zip.textContent = 'Download ZIP';
         zipSlot.appendChild(zip);
       }
 
-      resultsMeta.textContent = `${payload.succeeded}/${payload.requested} erfolgreich · ${payload.failed} fehlgeschlagen · layout=${payload.layout}`;
+      resultsMeta.textContent = `${payload.succeeded}/${payload.requested} succeeded · ${payload.failed} failed · layout=${payload.layout}`;
       resultsPanel.classList.remove('hidden');
 
       items.forEach((item) => {
@@ -1430,45 +1357,132 @@ def _render_index(error: str | None = None) -> str:
 
       const chosen = selectedFiles();
       if (chosen.length === 0) {
-        statusEl.textContent = 'Bitte mindestens eine Box auswählen.';
+        statusEl.textContent = 'Please select at least one box.';
         return;
       }
 
-      const formData = new FormData(form);
-      statusEl.textContent = `Starte parallele Generierung für ${chosen.length} Datei(en) ...`;
       generateBtn.disabled = true;
+      while (resultsGrid.firstChild) resultsGrid.removeChild(resultsGrid.firstChild);
+      while (zipSlot.firstChild) zipSlot.removeChild(zipSlot.firstChild);
+      resultsMeta.textContent = '';
+      resultsPanel.classList.remove('hidden');
 
-      try {
-        const resp = await fetch('/api/generate-batch', {
-          method: 'POST',
-          body: formData,
-        });
-        const payload = await parseJsonResponse(resp);
-        renderResults(payload);
-        statusEl.textContent = `Fertig: ${payload.succeeded}/${payload.requested} erfolgreich.`;
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        statusEl.textContent = `Fehler: ${msg}`;
-      } finally {
-        generateBtn.disabled = false;
+      let completed = 0;
+      const total = chosen.length;
+      const fileResults = [];
+      const cardMap = {};
+
+      statusEl.textContent = `Generating 0/${total} ...`;
+
+      chosen.forEach((file) => {
+        const card = document.createElement('article');
+        card.className = 'result-card loading';
+        const head = document.createElement('div');
+        head.className = 'result-head';
+        const title = document.createElement('div');
+        title.className = 'result-title';
+        title.textContent = file;
+        const meta = document.createElement('div');
+        meta.className = 'result-meta';
+        meta.textContent = 'generating\u2026';
+        head.appendChild(title);
+        head.appendChild(meta);
+        const skeleton = document.createElement('div');
+        skeleton.className = 'loading-skeleton';
+        card.appendChild(head);
+        card.appendChild(skeleton);
+        resultsGrid.appendChild(card);
+        cardMap[file] = card;
+      });
+
+      const promises = chosen.map(async (file) => {
+        const fd = new FormData();
+        fd.set('step_file', file);
+        fd.set('thickness', thicknessInput.value);
+        fd.set('finger_width', fingerWidthInput.value);
+        fd.set('kerf', kerfInput.value);
+        fd.set('layout', layoutSel.value);
+        fd.set('sheet_width', sheetWidthInput.value);
+        fd.set('sheet_height', sheetHeightInput.value);
+        fd.set('part_gap', partGapInput.value);
+        fd.set('sheet_gap', sheetGapInput.value);
+
+        try {
+          const resp = await fetch('/api/generate-single', {
+            method: 'POST',
+            body: fd,
+          });
+          const result = await parseJsonResponse(resp);
+          fileResults.push(result);
+          const placeholder = cardMap[file];
+          if (placeholder) {
+            const newCard = result.ok ? buildSuccessCard(result) : buildErrorCard(result);
+            newCard.style.animation = 'cardIn .3s ease both';
+            placeholder.replaceWith(newCard);
+          }
+        } catch (error) {
+          const errResult = {
+            step_file: file,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+            elapsed_s: 0,
+          };
+          fileResults.push(errResult);
+          const placeholder = cardMap[file];
+          if (placeholder) {
+            placeholder.replaceWith(buildErrorCard(errResult));
+          }
+        }
+
+        completed++;
+        statusEl.textContent = `Generated ${completed}/${total} ...`;
+      });
+
+      await Promise.all(promises);
+
+      const succeeded = fileResults.filter((r) => r.ok).length;
+      const failed = total - succeeded;
+      statusEl.textContent = `Done: ${succeeded}/${total} succeeded.`;
+      resultsMeta.textContent = `${succeeded}/${total} succeeded \u00b7 ${failed} failed \u00b7 layout=${layoutSel.value}`;
+
+      const successResults = fileResults.filter((r) => r.ok && r.download_url);
+      if (successResults.length > 0) {
+        try {
+          const refs = successResults.map((r) => {
+            const parts = r.download_url.split('/');
+            return { job_id: parts[3], file_token: parts[5] };
+          });
+          const zipResp = await fetch('/api/bundle-zip', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ files: refs }),
+          });
+          const zipData = await parseJsonResponse(zipResp);
+          if (zipData.zip_url) {
+            const zip = document.createElement('a');
+            zip.className = 'download-zip';
+            zip.href = zipData.zip_url;
+            zip.textContent = 'Download ZIP';
+            zipSlot.appendChild(zip);
+          }
+        } catch (_) {
+          /* zip bundling failed; individual downloads still work */
+        }
       }
+
+      generateBtn.disabled = false;
     });
 
     selectAllBtn.addEventListener('click', () => {
       setAllStepCheckboxes(true);
-      updateOriginPreview();
       saveSettings();
     });
     selectNoneBtn.addEventListener('click', () => {
       setAllStepCheckboxes(false);
-      updateOriginPreview();
       saveSettings();
     });
     stepCheckboxes.forEach((cb) => {
-      cb.addEventListener('change', () => {
-        updateOriginPreview(cb.checked ? cb.value : null);
-        saveSettings();
-      });
+      cb.addEventListener('change', saveSettings);
     });
     persistedInputs.forEach((el) => {
       if (!el) {
@@ -1481,9 +1495,16 @@ def _render_index(error: str | None = None) -> str:
       syncLayout();
       saveSettings();
     });
+    modalCloseBtn.addEventListener('click', closeSvgModal);
+    svgModal.addEventListener('click', (e) => {
+      if (e.target === svgModal) closeSvgModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeSvgModal();
+    });
     restoreSettings();
     syncLayout();
-    updateOriginPreview();
+    initStepThumbnails();
   </script>
 </body>
 </html>"""
@@ -1502,6 +1523,19 @@ def index() -> HTMLResponse:
 @app.get("/healthz", response_class=JSONResponse)
 def healthz() -> JSONResponse:
     return JSONResponse({"ok": True})
+
+
+@app.get("/camera-test", response_class=HTMLResponse)
+def camera_test() -> HTMLResponse:
+    # Try project root (dev) then /app (Docker)
+    candidates = [
+        Path(__file__).resolve().parent.parent.parent / "camera_test.html",
+        Path("/app/camera_test.html"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return HTMLResponse(p.read_text())
+    raise HTTPException(status_code=404, detail="camera_test.html not found")
 
 
 @app.get("/api/step-preview/{step_file:path}", response_class=JSONResponse)
@@ -1560,6 +1594,88 @@ def generate_batch(
     return JSONResponse(payload)
 
 
+@app.post("/api/generate-single", response_class=JSONResponse)
+def generate_single_api(
+    step_file: str = Form(...),
+    thickness: float = Form(3.2),
+    finger_width: float = Form(20.0),
+    kerf: float = Form(0.0),
+    layout: str = Form("unfolded"),
+    sheet_width: str | None = Form(None),
+    sheet_height: str | None = Form(None),
+    part_gap: float = Form(4.0),
+    sheet_gap: float = Form(20.0),
+) -> JSONResponse:
+    if layout not in {"unfolded", "packed"}:
+        raise HTTPException(status_code=400, detail="layout must be 'unfolded' or 'packed'")
+
+    try:
+        parsed_sheet_width = _parse_optional_float(sheet_width)
+        parsed_sheet_height = _parse_optional_float(sheet_height)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid sheet size: {exc}") from exc
+
+    if layout == "packed":
+        if parsed_sheet_width is None or parsed_sheet_height is None:
+            raise HTTPException(status_code=400, detail="packed layout requires sheet width and height")
+        if parsed_sheet_width <= 0 or parsed_sheet_height <= 0:
+            raise HTTPException(status_code=400, detail="sheet dimensions must be > 0")
+
+    available = set(_available_step_files())
+    if step_file not in available:
+        raise HTTPException(status_code=404, detail=f"Unknown step file: {step_file}")
+
+    _cleanup_expired_jobs()
+
+    job_id = f"{int(time.time())}-{os.urandom(4).hex()}"
+    job_dir = _job_root() / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    result = _generate_single_file(
+        step_file,
+        thickness=thickness,
+        finger_width=finger_width,
+        kerf=kerf,
+        layout=layout,
+        sheet_width=parsed_sheet_width,
+        sheet_height=parsed_sheet_height,
+        part_gap=part_gap,
+        sheet_gap=sheet_gap,
+        job_dir=job_dir,
+    )
+
+    file_entries: dict[str, dict[str, str]] = {}
+    response: dict[str, Any] = {
+        "job_id": job_id,
+        "step_file": result["step_file"],
+        "ok": result.get("ok", False),
+        "elapsed_s": result.get("elapsed_s", 0.0),
+    }
+
+    if result.get("ok"):
+        token = os.urandom(9).hex()
+        file_entries[token] = {
+            "path": result["output_path"],
+            "filename": result["filename"],
+            "step_file": result["step_file"],
+        }
+        response["filename"] = result["filename"]
+        response["download_url"] = f"/api/jobs/{job_id}/files/{token}"
+        response["preview_url"] = f"/api/jobs/{job_id}/files/{token}"
+    else:
+        response["error"] = result.get("error", "Unknown error")
+
+    with _JOB_LOCK:
+        _JOB_INDEX[job_id] = {
+            "created_at": time.time(),
+            "job_dir": str(job_dir),
+            "files": file_entries,
+            "zip_path": None,
+        }
+
+    return JSONResponse(response)
+
+
 @app.get("/api/jobs/{job_id}/files/{file_token}")
 def download_job_file(job_id: str, file_token: str) -> FileResponse:
     job = _get_job(job_id)
@@ -1592,6 +1708,51 @@ def download_job_zip(job_id: str) -> FileResponse:
         media_type="application/zip",
         filename=f"lasercut-{job_id}.zip",
     )
+
+
+@app.post("/api/bundle-zip", response_class=JSONResponse)
+async def bundle_zip(request: Request) -> JSONResponse:
+    body = await request.json()
+    file_refs = body.get("files", [])
+
+    if not file_refs:
+        raise HTTPException(status_code=400, detail="No files to bundle")
+
+    candidates: list[dict[str, str]] = []
+    with _JOB_LOCK:
+        for ref in file_refs:
+            jid = ref.get("job_id", "")
+            tok = ref.get("file_token", "")
+            job = _JOB_INDEX.get(jid)
+            if not job:
+                continue
+            info = job.get("files", {}).get(tok)
+            if info:
+                candidates.append({"path": info["path"], "filename": info["filename"]})
+
+    entries = [c for c in candidates if Path(c["path"]).exists()]
+
+    if not entries:
+        raise HTTPException(status_code=400, detail="No valid files found")
+
+    zip_job_id = f"{int(time.time())}-{os.urandom(4).hex()}"
+    zip_job_dir = _job_root() / zip_job_id
+    zip_job_dir.mkdir(parents=True, exist_ok=True)
+
+    zip_path = zip_job_dir / f"generated-{zip_job_id}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for entry in entries:
+            zf.write(entry["path"], arcname=entry["filename"])
+
+    with _JOB_LOCK:
+        _JOB_INDEX[zip_job_id] = {
+            "created_at": time.time(),
+            "job_dir": str(zip_job_dir),
+            "files": {},
+            "zip_path": str(zip_path),
+        }
+
+    return JSONResponse({"zip_url": f"/api/jobs/{zip_job_id}/download.zip"})
 
 
 @app.post("/generate")
