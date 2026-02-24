@@ -27,6 +27,8 @@ _JOB_INDEX: dict[str, dict[str, Any]] = {}
 _JOB_TTL_SECONDS = int(float(os.getenv("LASERCUT_WEB_JOB_TTL_SECONDS", "21600")))
 _JOB_MAX_WORKERS = max(1, int(float(os.getenv("LASERCUT_WEB_MAX_WORKERS", "4"))))
 _FIXED_PACK_ROTATIONS = 8
+_PREVIEW_LOCK = Lock()
+_STEP_PREVIEW_CACHE: dict[str, dict[str, Any] | None] = {}
 
 
 def _repo_root() -> Path:
@@ -180,6 +182,18 @@ def _mesh_from_step(step_path: Path, tess_tol: float = 1.0) -> dict[str, Any] | 
             "max": [round(max_x, 4), round(max_y, 4), round(max_z, 4)],
         },
     }
+
+
+def _get_step_preview_mesh(step_file: str) -> dict[str, Any] | None:
+    with _PREVIEW_LOCK:
+        if step_file in _STEP_PREVIEW_CACHE:
+            return _STEP_PREVIEW_CACHE[step_file]
+
+    mesh = _mesh_from_step(_step_dir() / step_file)
+
+    with _PREVIEW_LOCK:
+        _STEP_PREVIEW_CACHE[step_file] = mesh
+    return mesh
 
 
 def _generate_single_file(
@@ -498,6 +512,58 @@ def _render_index(error: str | None = None) -> str:
       background: #fbfcfa;
       padding: 10px;
     }
+    .origin-preview {
+      border: 1px solid #d2ddd4;
+      border-radius: 10px;
+      background: #f7faf7;
+      padding: 8px;
+      margin-bottom: 9px;
+    }
+    .origin-preview-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 6px;
+      font-size: 12px;
+      color: #2a3a31;
+      font-weight: 700;
+    }
+    .origin-preview-name {
+      color: #3f5448;
+      font-weight: 600;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 11px;
+      max-width: 100%;
+      overflow-wrap: anywhere;
+    }
+    .origin-preview-canvas {
+      border: 1px solid #d6e0d8;
+      border-radius: 8px;
+      background: #f0f5f1;
+      min-height: 240px;
+      height: 240px;
+      overflow: hidden;
+      position: relative;
+    }
+    .origin-preview-canvas canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .origin-preview-note {
+      position: absolute;
+      left: 8px;
+      top: 8px;
+      font-size: 11px;
+      color: #52665b;
+      background: rgba(255, 255, 255, 0.86);
+      border: 1px solid #d7e1d9;
+      border-radius: 6px;
+      padding: 2px 6px;
+      pointer-events: none;
+    }
     .step-tools {
       display: flex;
       gap: 8px;
@@ -742,6 +808,16 @@ def _render_index(error: str | None = None) -> str:
           <div class="full">
             <label class="label">STEP Files</label>
             <div class="step-box">
+              <div class="origin-preview">
+                <div class="origin-preview-head">
+                  <span>Original STEP Vorschau (fester Blickwinkel)</span>
+                  <span id="origin-preview-name" class="origin-preview-name">Lade Vorschau ...</span>
+                </div>
+                <div class="origin-preview-canvas">
+                  <canvas id="origin-preview-canvas"></canvas>
+                  <div class="origin-preview-note">Originalmodell</div>
+                </div>
+              </div>
               <div class="step-tools">
                 <button type="button" class="tiny-btn" id="select-all">Alle auswählen</button>
                 <button type="button" class="tiny-btn" id="select-none">Alle abwählen</button>
@@ -826,6 +902,11 @@ def _render_index(error: str | None = None) -> str:
     const zipSlot = document.getElementById('zip-slot');
     const selectAllBtn = document.getElementById('select-all');
     const selectNoneBtn = document.getElementById('select-none');
+    const originPreviewCanvas = document.getElementById('origin-preview-canvas');
+    const originPreviewName = document.getElementById('origin-preview-name');
+    const stepPreviewCache = new Map();
+    let activePreviewStepFile = null;
+    const stepCheckboxes = Array.from(document.querySelectorAll('input[name="step_files"]'));
 
     function syncLayout() {
       packedBlock.classList.toggle('visible', layoutSel.value === 'packed');
@@ -842,6 +923,121 @@ def _render_index(error: str | None = None) -> str:
       });
     }
 
+    function clearViewer(canvas) {
+      const cleanup = canvas.__viewerCleanup;
+      if (typeof cleanup === 'function') {
+        cleanup();
+      }
+      canvas.__viewerCleanup = null;
+    }
+
+    function drawMeshUnavailable(canvas, message) {
+      clearViewer(canvas);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        return;
+      }
+      const w = canvas.clientWidth || 400;
+      const h = canvas.clientHeight || 220;
+      canvas.width = w;
+      canvas.height = h;
+      ctx.fillStyle = '#f5f8f5';
+      ctx.fillRect(0, 0, w, h);
+      ctx.fillStyle = '#607063';
+      ctx.font = '13px Segoe UI';
+      ctx.fillText(message, 14, 24);
+    }
+
+    function initFixedMeshViewer(canvas, meshData) {
+      if (!window.THREE || !meshData || !meshData.vertices || !meshData.triangles || meshData.triangles.length === 0) {
+        drawMeshUnavailable(canvas, 'Original 3D preview unavailable');
+        return;
+      }
+
+      clearViewer(canvas);
+      const THREE = window.THREE;
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0xf5f8f5);
+      const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 20000);
+
+      const triCount = meshData.triangles.length;
+      const positions = new Float32Array(triCount * 9);
+      let ptr = 0;
+
+      for (const tri of meshData.triangles) {
+        const a = meshData.vertices[tri[0]];
+        const b = meshData.vertices[tri[1]];
+        const c = meshData.vertices[tri[2]];
+        positions[ptr++] = a[0]; positions[ptr++] = a[1]; positions[ptr++] = a[2];
+        positions[ptr++] = b[0]; positions[ptr++] = b[1]; positions[ptr++] = b[2];
+        positions[ptr++] = c[0]; positions[ptr++] = c[1]; positions[ptr++] = c[2];
+      }
+
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+      geometry.computeVertexNormals();
+
+      const group = new THREE.Group();
+      const solidMaterial = new THREE.MeshStandardMaterial({
+        color: 0xd7e6da,
+        metalness: 0.05,
+        roughness: 0.86,
+        side: THREE.DoubleSide,
+      });
+      const edgeGeometry = new THREE.EdgesGeometry(geometry, 22);
+      const edgeMaterial = new THREE.LineBasicMaterial({ color: 0x2c6848 });
+      const solid = new THREE.Mesh(geometry, solidMaterial);
+      const wire = new THREE.LineSegments(edgeGeometry, edgeMaterial);
+      group.add(solid);
+      group.add(wire);
+      scene.add(group);
+
+      const bbox = new THREE.Box3().setFromObject(solid);
+      const center = bbox.getCenter(new THREE.Vector3());
+      group.position.set(-center.x, -center.y, -center.z);
+
+      const size = bbox.getSize(new THREE.Vector3());
+      const radius = Math.max(size.x, size.y, size.z) * 0.55 || 1;
+      camera.position.set(radius * 2.2, radius * 1.55, radius * 2.2);
+      camera.lookAt(0, 0, 0);
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.72));
+      const key = new THREE.DirectionalLight(0xffffff, 0.58);
+      key.position.set(1.8, 2.2, 1.4);
+      scene.add(key);
+      const rim = new THREE.DirectionalLight(0xffffff, 0.33);
+      rim.position.set(-1.1, -0.8, -1.4);
+      scene.add(rim);
+
+      const render = () => {
+        renderer.render(scene, camera);
+      };
+      const resize = () => {
+        const w = Math.max(10, canvas.clientWidth);
+        const h = Math.max(10, canvas.clientHeight);
+        renderer.setSize(w, h, false);
+        camera.aspect = w / h;
+        camera.updateProjectionMatrix();
+        render();
+      };
+
+      const observer = new ResizeObserver(resize);
+      observer.observe(canvas);
+      resize();
+
+      canvas.__viewerCleanup = () => {
+        observer.disconnect();
+        renderer.dispose();
+        edgeGeometry.dispose();
+        geometry.dispose();
+        edgeMaterial.dispose();
+        solidMaterial.dispose();
+      };
+    }
+
     async function parseJsonResponse(resp) {
       let payload = null;
       try {
@@ -856,6 +1052,54 @@ def _render_index(error: str | None = None) -> str:
       }
 
       return payload;
+    }
+
+    async function fetchStepPreviewMesh(stepFile) {
+      if (stepPreviewCache.has(stepFile)) {
+        return stepPreviewCache.get(stepFile);
+      }
+      const encoded = encodeURIComponent(stepFile);
+      const resp = await fetch(`/api/step-preview/${encoded}`);
+      const payload = await parseJsonResponse(resp);
+      const mesh = payload && payload.mesh ? payload.mesh : null;
+      stepPreviewCache.set(stepFile, mesh);
+      return mesh;
+    }
+
+    async function renderOriginPreview(stepFile) {
+      activePreviewStepFile = stepFile;
+      if (!stepFile) {
+        originPreviewName.textContent = 'Keine Auswahl';
+        drawMeshUnavailable(originPreviewCanvas, 'Keine STEP-Datei ausgewahlt');
+        return;
+      }
+
+      originPreviewName.textContent = `${stepFile} (lade ...)`;
+      try {
+        const mesh = await fetchStepPreviewMesh(stepFile);
+        if (activePreviewStepFile !== stepFile) {
+          return;
+        }
+        originPreviewName.textContent = stepFile;
+        initFixedMeshViewer(originPreviewCanvas, mesh);
+      } catch (error) {
+        if (activePreviewStepFile !== stepFile) {
+          return;
+        }
+        originPreviewName.textContent = `${stepFile} (Vorschau fehlgeschlagen)`;
+        drawMeshUnavailable(originPreviewCanvas, 'Original 3D preview unavailable');
+      }
+    }
+
+    function updateOriginPreview(preferredFile = null) {
+      const chosen = selectedFiles();
+      let target = null;
+      if (preferredFile && chosen.includes(preferredFile)) {
+        target = preferredFile;
+      } else if (chosen.length > 0) {
+        target = chosen[0];
+      }
+      void renderOriginPreview(target);
     }
 
     function buildErrorCard(item) {
@@ -1166,10 +1410,22 @@ def _render_index(error: str | None = None) -> str:
       }
     });
 
-    selectAllBtn.addEventListener('click', () => setAllStepCheckboxes(true));
-    selectNoneBtn.addEventListener('click', () => setAllStepCheckboxes(false));
+    selectAllBtn.addEventListener('click', () => {
+      setAllStepCheckboxes(true);
+      updateOriginPreview();
+    });
+    selectNoneBtn.addEventListener('click', () => {
+      setAllStepCheckboxes(false);
+      updateOriginPreview();
+    });
+    stepCheckboxes.forEach((cb) => {
+      cb.addEventListener('change', () => {
+        updateOriginPreview(cb.checked ? cb.value : null);
+      });
+    });
     layoutSel.addEventListener('change', syncLayout);
     syncLayout();
+    updateOriginPreview();
   </script>
 </body>
 </html>"""
@@ -1188,6 +1444,21 @@ def index() -> HTMLResponse:
 @app.get("/healthz", response_class=JSONResponse)
 def healthz() -> JSONResponse:
     return JSONResponse({"ok": True})
+
+
+@app.get("/api/step-preview/{step_file:path}", response_class=JSONResponse)
+def step_preview(step_file: str) -> JSONResponse:
+    available = _available_step_files()
+    if step_file not in available:
+        raise HTTPException(status_code=404, detail=f"Unknown step file: {step_file}")
+
+    mesh = _get_step_preview_mesh(step_file)
+    return JSONResponse(
+        {
+            "step_file": step_file,
+            "mesh": mesh,
+        }
+    )
 
 
 @app.post("/api/generate-batch", response_class=JSONResponse)
