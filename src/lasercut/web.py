@@ -1689,7 +1689,12 @@ def download_job_file(job_id: str, file_token: str) -> FileResponse:
         raise HTTPException(status_code=404, detail="File not found")
 
     media_type = "image/svg+xml" if path.suffix.lower() == ".svg" else "application/octet-stream"
-    return FileResponse(path, media_type=media_type, filename=info["filename"])
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=info["filename"],
+        headers={"Cache-Control": "no-store, must-revalidate", "Pragma": "no-cache"},
+    )
 
 
 @app.get("/api/jobs/{job_id}/download.zip")
