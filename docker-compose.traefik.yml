@@ -1,0 +1,19 @@
+services:
+  lego-sorter-bin-generator:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lego-sorter-bin-generator
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.lego-sorter-bin-generator.rule=Host(`lego-sorter-bin-generator.traefik.me`)
+      - traefik.http.routers.lego-sorter-bin-generator.entrypoints=web
+      - traefik.http.services.lego-sorter-bin-generator.loadbalancer.server.port=8000
+    networks:
+      - traefik
+
+networks:
+  traefik:
+    external: true

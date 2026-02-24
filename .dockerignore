@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+*.pyc
+output
+.claude
+debug_issues.py
+extract_faces.py
+extract_key_params.py
+verify_approach.py
+verify_approach2.py
+verify_rewrite.py
