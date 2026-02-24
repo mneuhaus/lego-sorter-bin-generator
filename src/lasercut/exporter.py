@@ -560,10 +560,17 @@ def _hinge_slots_for_seam(
         na = (-na[0], -na[1])
 
     # Fusion-style lattice parameters: staggered rows across a hinge band.
-    band_half = max(3.2, thickness * 1.4)
+    band_half = 3.0 * max(3.2, thickness * 1.4)
     row_pitch = max(1.9, thickness * 0.6)
     slot_len = max(7.5, thickness * 2.6)
     link_gap = max(1.6, thickness * 0.5)
+    # Optional "double-cut": render each hinge slit as two close parallel lines.
+    double_cut_gap = 0.15
+    if double_cut_gap > 0:
+        half_gap = max(0.05, min(0.20, double_cut_gap)) * 0.5
+        row_line_offsets = (-half_gap, half_gap)
+    else:
+        row_line_offsets = (0.0,)
 
     y_start = -band_half
     y_end = band_half
@@ -627,29 +634,30 @@ def _hinge_slots_for_seam(
     for row in range(row_count):
         y_off = y0 + row * row_pitch
         phase = 0.0 if row % 2 == 0 else period * 0.5
+        for line_off in row_line_offsets:
+            y_line = y_off + line_off
+            p_start = (
+                mid[0] - t[0] * extend + na[0] * y_line,
+                mid[1] - t[1] * extend + na[1] * y_line,
+            )
+            p_end = (
+                mid[0] + t[0] * extend + na[0] * y_line,
+                mid[1] + t[1] * extend + na[1] * y_line,
+            )
 
-        p_start = (
-            mid[0] - t[0] * extend + na[0] * y_off,
-            mid[1] - t[1] * extend + na[1] * y_off,
-        )
-        p_end = (
-            mid[0] + t[0] * extend + na[0] * y_off,
-            mid[1] + t[1] * extend + na[1] * y_off,
-        )
+            row_line = LineString([p_start, p_end])
+            inside = piece_poly.intersection(row_line)
+            for s0, s1 in _collect_segments(inside):
+                seg_vec = (s1[0] - s0[0], s1[1] - s0[1])
+                seg_len = math.hypot(seg_vec[0], seg_vec[1])
+                if seg_len < 0.8:
+                    continue
 
-        row_line = LineString([p_start, p_end])
-        inside = piece_poly.intersection(row_line)
-        for s0, s1 in _collect_segments(inside):
-            seg_vec = (s1[0] - s0[0], s1[1] - s0[1])
-            seg_len = math.hypot(seg_vec[0], seg_vec[1])
-            if seg_len < 0.8:
-                continue
-
-            ux, uy = (seg_vec[0] / seg_len, seg_vec[1] / seg_len)
-            for lo, hi in _pattern_intervals(seg_len, phase):
-                a = (s0[0] + ux * lo, s0[1] + uy * lo)
-                b = (s0[0] + ux * hi, s0[1] + uy * hi)
-                loops.append([a, b])
+                ux, uy = (seg_vec[0] / seg_len, seg_vec[1] / seg_len)
+                for lo, hi in _pattern_intervals(seg_len, phase):
+                    a = (s0[0] + ux * lo, s0[1] + uy * lo)
+                    b = (s0[0] + ux * hi, s0[1] + uy * hi)
+                    loops.append([a, b])
 
     return loops
 
