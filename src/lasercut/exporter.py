@@ -24,9 +24,12 @@ except ImportError:
     svgwrite = None  # type: ignore[assignment]
 
 try:
-    from shapely.geometry import Polygon
+    from shapely.geometry import Polygon, LineString
+    from shapely.ops import unary_union
 except ImportError:
     Polygon = None  # type: ignore[assignment]
+    LineString = None  # type: ignore[assignment]
+    unary_union = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +387,351 @@ class Panel2D:
             _vec_dot(pt, self.u_axis) - self.offset_x,
             _vec_dot(pt, self.v_axis) - self.offset_y,
         )
+
+
+@dataclass
+class Piece2D:
+    name: str
+    outline: list[tuple[float, float]]
+    holes: list[list[tuple[float, float]]]
+
+
+def _poly_centroid_xy(pts: list[tuple[float, float]]) -> tuple[float, float]:
+    if not pts:
+        return (0.0, 0.0)
+    return (sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts))
+
+
+def _ring_to_loop(ring) -> list[tuple[float, float]]:
+    coords = list(ring.coords)
+    if len(coords) <= 1:
+        return []
+    return [(float(x), float(y)) for x, y in coords[:-1]]
+
+
+def _rect_loop(
+    origin: tuple[float, float],
+    x_dir: tuple[float, float],
+    y_dir: tuple[float, float],
+    dx: float,
+    dy: float,
+) -> list[tuple[float, float]]:
+    x0, y0 = origin
+    ux, uy = x_dir
+    vx, vy = y_dir
+    p1 = (x0, y0)
+    p2 = (x0 + ux * dx, y0 + uy * dx)
+    p3 = (p2[0] + vx * dy, p2[1] + vy * dy)
+    p4 = (x0 + vx * dy, y0 + vy * dy)
+    return [p1, p2, p3, p4]
+
+
+def _hinge_adjacency(
+    living_hinge_seams: list[SharedEdge],
+) -> dict[str, list[tuple[str, SharedEdge]]]:
+    adj: dict[str, list[tuple[str, SharedEdge]]] = {}
+    for se in living_hinge_seams:
+        adj.setdefault(se.panel_a, []).append((se.panel_b, se))
+        adj.setdefault(se.panel_b, []).append((se.panel_a, se))
+    return adj
+
+
+def _connected_components(
+    nodes: list[str],
+    adj: dict[str, list[tuple[str, SharedEdge]]],
+) -> list[list[str]]:
+    seen: set[str] = set()
+    comps: list[list[str]] = []
+    for node in nodes:
+        if node in seen:
+            continue
+        stack = [node]
+        comp: list[str] = []
+        seen.add(node)
+        while stack:
+            cur = stack.pop()
+            comp.append(cur)
+            for nxt, _ in adj.get(cur, []):
+                if nxt in seen:
+                    continue
+                seen.add(nxt)
+                stack.append(nxt)
+        comps.append(comp)
+    return comps
+
+
+def _hinge_neighbor_transform(
+    current: str,
+    neighbor: str,
+    se: SharedEdge,
+    panel_map: dict[str, Panel2D],
+    placed_outline: dict[str, list[tuple[float, float]]],
+    placed_xform: dict[str, Affine2D],
+) -> tuple[list[tuple[float, float]], list[list[tuple[float, float]]], Affine2D] | None:
+    cur_outline = placed_outline[current]
+    cur_xform = placed_xform[current]
+    cur_p2d = panel_map[current]
+    nbr_p2d = panel_map[neighbor]
+
+    se_cur_a = cur_p2d.project_3d(se.start_3d)
+    se_cur_b = cur_p2d.project_3d(se.end_3d)
+    se_nbr_a = nbr_p2d.project_3d(se.start_3d)
+    se_nbr_b = nbr_p2d.project_3d(se.end_3d)
+
+    se_svg_a = cur_xform.apply(*se_cur_a)
+    se_svg_b = cur_xform.apply(*se_cur_b)
+    se_svg_mid = ((se_svg_a[0] + se_svg_b[0]) / 2, (se_svg_a[1] + se_svg_b[1]) / 2)
+
+    se_svg_dx = se_svg_b[0] - se_svg_a[0]
+    se_svg_dy = se_svg_b[1] - se_svg_a[1]
+    if math.hypot(se_svg_dx, se_svg_dy) < 1e-6:
+        return None
+    angle_svg = math.atan2(se_svg_dy, se_svg_dx)
+
+    se_nbr_dx = se_nbr_b[0] - se_nbr_a[0]
+    se_nbr_dy = se_nbr_b[1] - se_nbr_a[1]
+    if math.hypot(se_nbr_dx, se_nbr_dy) < 1e-6:
+        return None
+    angle_nbr = math.atan2(se_nbr_dy, se_nbr_dx)
+
+    out_n = _outward_normal_2d(cur_outline, se_svg_a, se_svg_b)
+    align_rot = angle_svg - angle_nbr
+    T_rot = Affine2D.from_rotation(align_rot)
+    T_ref = Affine2D.from_reflection(angle_svg)
+    T_rot_ref = T_ref.compose(T_rot)
+    se_nbr_mid = ((se_nbr_a[0] + se_nbr_b[0]) / 2, (se_nbr_a[1] + se_nbr_b[1]) / 2)
+
+    def _candidate(base: Affine2D) -> tuple[list[tuple[float, float]], list[list[tuple[float, float]]], Affine2D, tuple[float, float]]:
+        xf_mid = base.apply(*se_nbr_mid)
+        T_trans = Affine2D.from_translation(se_svg_mid[0] - xf_mid[0], se_svg_mid[1] - xf_mid[1])
+        xform = T_trans.compose(base)
+        final_outline = xform.apply_pts(nbr_p2d.outline)
+        final_holes = [xform.apply_pts(h) for h in nbr_p2d.holes]
+
+        others = [o for n, o in placed_outline.items() if n != current]
+        overlap = _total_overlap_area(final_outline, others) if others else 0.0
+        cx, cy = _poly_centroid_xy(final_outline)
+        to_nbr = (cx - se_svg_mid[0], cy - se_svg_mid[1])
+        outward = to_nbr[0] * out_n[0] + to_nbr[1] * out_n[1]
+        # Prefer outward placement when overlaps are equivalent.
+        score = (overlap, 0.0 if outward > 0 else 1.0)
+        return final_outline, final_holes, xform, score
+
+    cand_ref = _candidate(T_rot_ref)
+    cand_rot = _candidate(T_rot)
+    if cand_ref[3] <= cand_rot[3]:
+        return cand_ref[0], cand_ref[1], cand_ref[2]
+    return cand_rot[0], cand_rot[1], cand_rot[2]
+
+
+def _hinge_slots_for_seam(
+    se: SharedEdge,
+    panel_map: dict[str, Panel2D],
+    panel_xform: dict[str, Affine2D],
+    piece_poly,
+    thickness: float,
+) -> list[list[tuple[float, float]]]:
+    if Polygon is None:
+        return []
+    if se.panel_a not in panel_map or se.panel_b not in panel_map:
+        return []
+    if se.panel_a not in panel_xform or se.panel_b not in panel_xform:
+        return []
+
+    pa = panel_map[se.panel_a]
+    pb = panel_map[se.panel_b]
+    xa = panel_xform[se.panel_a]
+    xb = panel_xform[se.panel_b]
+
+    a0 = xa.apply(*pa.project_3d(se.start_3d))
+    a1 = xa.apply(*pa.project_3d(se.end_3d))
+    dx = a1[0] - a0[0]
+    dy = a1[1] - a0[1]
+    seam_len = math.hypot(dx, dy)
+    if seam_len < 8.0:
+        return []
+
+    t = (dx / seam_len, dy / seam_len)
+    na = _outward_normal_2d(xa.apply_pts(pa.outline), a0, a1)
+    cb = _poly_centroid_xy(xb.apply_pts(pb.outline))
+    mid = ((a0[0] + a1[0]) / 2.0, (a0[1] + a1[1]) / 2.0)
+    if na[0] * (cb[0] - mid[0]) + na[1] * (cb[1] - mid[1]) < 0:
+        na = (-na[0], -na[1])
+
+    # Fusion-style lattice parameters: staggered rows across a hinge band.
+    band_half = max(3.2, thickness * 1.4)
+    row_pitch = max(1.9, thickness * 0.6)
+    slot_width = max(0.55, min(1.1, thickness * 0.28))
+    slot_len = max(7.5, thickness * 2.6)
+    link_gap = max(1.6, thickness * 0.5)
+    end_margin = max(3.0, thickness * 0.85)
+
+    usable_start = end_margin
+    usable_end = seam_len - end_margin
+    if usable_end - usable_start <= slot_len:
+        return []
+
+    y_start = -band_half + slot_width * 0.5
+    y_end = band_half - slot_width * 0.5
+    if y_end <= y_start:
+        return []
+
+    row_count = int((y_end - y_start) / row_pitch) + 1
+    if row_count < 2:
+        row_count = 2
+    total_rows_span = (row_count - 1) * row_pitch
+    y0 = -total_rows_span / 2.0
+
+    loops: list[list[tuple[float, float]]] = []
+    safe_poly = piece_poly.buffer(-0.08)
+    for row in range(row_count):
+        y_off = y0 + row * row_pitch
+        phase = 0.0 if row % 2 == 0 else (slot_len + link_gap) * 0.5
+        x = usable_start + phase
+        while x + slot_len <= usable_end:
+            origin = (
+                a0[0] + t[0] * x + na[0] * (y_off - slot_width * 0.5),
+                a0[1] + t[1] * x + na[1] * (y_off - slot_width * 0.5),
+            )
+            rect = _rect_loop(origin, t, na, slot_len, slot_width)
+            try:
+                poly = Polygon(rect)
+                if poly.is_valid and poly.area > 1e-6 and safe_poly.contains(poly):
+                    loops.append(rect)
+            except Exception:
+                pass
+            x += slot_len + link_gap
+
+    return loops
+
+
+def _build_piece_map(
+    model: BinModel,
+    panel_map: dict[str, Panel2D],
+) -> dict[str, Piece2D]:
+    names = list(panel_map.keys())
+    seams = [
+        se for se in model.living_hinge_seams
+        if se.panel_a in panel_map and se.panel_b in panel_map
+    ]
+    if not seams or Polygon is None or unary_union is None or LineString is None:
+        return {
+            n: Piece2D(name=n, outline=list(panel_map[n].outline), holes=[list(h) for h in panel_map[n].holes])
+            for n in names
+        }
+
+    hinge_adj = _hinge_adjacency(seams)
+
+    pieces: dict[str, Piece2D] = {}
+    for comp in _connected_components(names, hinge_adj):
+        if len(comp) == 1:
+            n = comp[0]
+            pieces[n] = Piece2D(name=n, outline=list(panel_map[n].outline), holes=[list(h) for h in panel_map[n].holes])
+            continue
+
+        comp_set = set(comp)
+        root = sorted(comp)[0]
+        placed_outline: dict[str, list[tuple[float, float]]] = {root: list(panel_map[root].outline)}
+        placed_holes: dict[str, list[list[tuple[float, float]]]] = {root: [list(h) for h in panel_map[root].holes]}
+        placed_xform: dict[str, Affine2D] = {root: Affine2D.identity()}
+
+        queue: deque[str] = deque([root])
+        while queue:
+            current = queue.popleft()
+            for neighbor, se in hinge_adj.get(current, []):
+                if neighbor not in comp_set or neighbor in placed_outline:
+                    continue
+                placed = _hinge_neighbor_transform(
+                    current=current,
+                    neighbor=neighbor,
+                    se=se,
+                    panel_map=panel_map,
+                    placed_outline=placed_outline,
+                    placed_xform=placed_xform,
+                )
+                if placed is None:
+                    continue
+                out, holes, xform = placed
+                placed_outline[neighbor] = out
+                placed_holes[neighbor] = holes
+                placed_xform[neighbor] = xform
+                queue.append(neighbor)
+
+        # Fallback: keep any unresolved members separate in this piece frame.
+        for n in comp:
+            if n in placed_outline:
+                continue
+            placed_outline[n] = list(panel_map[n].outline)
+            placed_holes[n] = [list(h) for h in panel_map[n].holes]
+            placed_xform[n] = Affine2D.identity()
+
+        polys = []
+        for n in comp:
+            out = placed_outline[n]
+            holes = placed_holes.get(n, [])
+            try:
+                poly = Polygon(out, holes)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if not poly.is_empty and poly.area > 1e-6:
+                    polys.append(poly)
+            except Exception:
+                continue
+
+        seam_bridges = []
+        for a in comp:
+            for b, se in hinge_adj.get(a, []):
+                if b not in comp_set or a > b:
+                    continue
+                pa = panel_map[se.panel_a]
+                xa = placed_xform[se.panel_a]
+                p0 = xa.apply(*pa.project_3d(se.start_3d))
+                p1 = xa.apply(*pa.project_3d(se.end_3d))
+                try:
+                    seam_bridges.append(LineString([p0, p1]).buffer(max(0.08, model.thickness * 0.03), cap_style=2))
+                except Exception:
+                    continue
+
+        merged = unary_union(polys + seam_bridges)
+        if hasattr(merged, "buffer"):
+            merged = merged.buffer(0)
+        if merged.geom_type == "MultiPolygon":
+            try:
+                merged = max(merged.geoms, key=lambda g: g.area)
+            except Exception:
+                pass
+        if merged.geom_type != "Polygon":
+            # Conservative fallback: keep root panel as piece if merge fails.
+            n = root
+            pieces[n] = Piece2D(name=n, outline=list(panel_map[n].outline), holes=[list(h) for h in panel_map[n].holes])
+            continue
+
+        piece_outline = _ring_to_loop(merged.exterior)
+        piece_holes = [_ring_to_loop(r) for r in merged.interiors]
+        piece_holes = [h for h in piece_holes if len(h) >= 3]
+
+        # Add hinge slit lattice holes for all seams inside this component.
+        for se in seams:
+            if se.panel_a not in comp_set or se.panel_b not in comp_set:
+                continue
+            piece_holes.extend(
+                _hinge_slots_for_seam(
+                    se,
+                    panel_map,
+                    placed_xform,
+                    merged,
+                    model.thickness,
+                )
+            )
+
+        piece_name = "+".join(sorted(comp))
+        pieces[piece_name] = Piece2D(
+            name=piece_name,
+            outline=piece_outline,
+            holes=piece_holes,
+        )
+
+    return pieces
 
 
 def _build_local_axes(
@@ -801,7 +1149,7 @@ def _candidate_points_for_sheet(
 
 
 def _make_oriented_geometry(
-    panel: Panel2D,
+    panel: Panel2D | Piece2D,
     angle_rad: float,
 ) -> dict[str, object]:
     rot = Affine2D.from_rotation(angle_rad)
@@ -853,7 +1201,7 @@ def _sheet_origins(
 
 
 def _compute_packed_layout(
-    panel_map: dict[str, Panel2D],
+    panel_map: dict[str, Panel2D | Piece2D],
     sheet_width: float,
     sheet_height: float,
     part_gap: float = 4.0,
@@ -1096,8 +1444,9 @@ def export_svg(
     if layout == "packed":
         if sheet_width is None or sheet_height is None:
             raise ValueError("packed layout requires sheet_width and sheet_height")
+        packed_map: dict[str, Panel2D | Piece2D] = _build_piece_map(model, panel_map)
         placed, sheet_rects = _compute_packed_layout(
-            panel_map,
+            packed_map,
             sheet_width=sheet_width,
             sheet_height=sheet_height,
             part_gap=max(0.0, part_gap),

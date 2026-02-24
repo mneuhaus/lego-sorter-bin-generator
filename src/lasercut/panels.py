@@ -47,6 +47,7 @@ class BinModel:
     shared_edges: list[SharedEdge]
     thickness: float
     source_solid: cq.Shape | None = None
+    living_hinge_seams: list[SharedEdge] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

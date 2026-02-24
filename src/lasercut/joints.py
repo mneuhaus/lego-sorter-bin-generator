@@ -473,20 +473,12 @@ def _apply_finger_joints_cqwarehouse(
                 kerf=kerf,
             )
 
-    hinge_slits = 0
     if hinge_seams:
         for se in hinge_seams:
             angle = _seam_panel_angle_deg(se, panels)
             print(
-                f"  Living-hinge: {se.panel_a}--{se.panel_b} "
+                f"  Living-hinge seam: {se.panel_a}--{se.panel_b} "
                 f"(angle={angle:.1f} deg < {living_hinge_angle_threshold_deg:.1f})"
-            )
-            hinge_slits += _apply_living_hinge_on_seam(
-                se,
-                panels,
-                corners,
-                model.thickness,
-                kerf=kerf,
             )
 
     trimmed_seams = _trim_side_wall_overhangs_against_back_wall(
@@ -500,7 +492,7 @@ def _apply_finger_joints_cqwarehouse(
     print(
         f"  cq_warehouse: jointed {len(matched_names)} panels "
         f"from {len(joint_edges)} edges ({len(through_slot_seams)} through-slots, "
-        f"{len(hinge_seams)} living-hinge seams / {hinge_slits} slits, "
+        f"{len(hinge_seams)} living-hinge seams, "
         f"{trimmed_seams} side-trimmed seams)"
     )
     return BinModel(
@@ -508,6 +500,7 @@ def _apply_finger_joints_cqwarehouse(
         shared_edges=model.shared_edges,
         thickness=model.thickness,
         source_solid=model.source_solid,
+        living_hinge_seams=hinge_seams,
     )
 
 
@@ -1383,15 +1376,6 @@ def apply_finger_joints(
         pa.solid = solid_a
         pb.solid = solid_b
 
-    for se in hinge_seams:
-        _apply_living_hinge_on_seam(
-            se,
-            panels,
-            corners,
-            thickness,
-            kerf=kerf,
-        )
-
     _trim_side_wall_overhangs_against_back_wall(
         model.shared_edges,
         panels,
@@ -1405,4 +1389,5 @@ def apply_finger_joints(
         shared_edges=model.shared_edges,
         thickness=thickness,
         source_solid=model.source_solid,
+        living_hinge_seams=hinge_seams,
     )
