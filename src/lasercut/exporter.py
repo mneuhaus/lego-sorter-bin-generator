@@ -51,6 +51,59 @@ def _translate_pts(
     return [(x + dx, y + dy) for x, y in pts]
 
 
+def _collapse_short_segments(
+    pts: list[tuple[float, float]],
+    min_len: float = 0.08,
+) -> list[tuple[float, float]]:
+    """Remove tiny colinear edge fragments from a closed polyline.
+
+    This intentionally avoids collapsing short segments at corners, because
+    those can encode real right-angle geometry and collapsing them can create
+    visible diagonal artifacts.
+    """
+    if len(pts) < 4:
+        return pts
+
+    def _is_colinear(
+        v1: tuple[float, float],
+        v2: tuple[float, float],
+        cos_tol: float = 0.995,
+    ) -> bool:
+        l1 = math.hypot(v1[0], v1[1])
+        l2 = math.hypot(v2[0], v2[1])
+        if l1 < 1e-9 or l2 < 1e-9:
+            return False
+        dot = (v1[0] * v2[0] + v1[1] * v2[1]) / (l1 * l2)
+        return abs(dot) >= cos_tol
+
+    out = list(pts)
+    changed = True
+    while changed and len(out) >= 4:
+        changed = False
+        n = len(out)
+        for i in range(n):
+            j = (i + 1) % n
+            dx = out[j][0] - out[i][0]
+            dy = out[j][1] - out[i][1]
+            if math.hypot(dx, dy) >= min_len:
+                continue
+            prev_i = (i - 1) % n
+            next_j = (j + 1) % n
+
+            v_prev = (out[i][0] - out[prev_i][0], out[i][1] - out[prev_i][1])
+            v_short = (out[j][0] - out[i][0], out[j][1] - out[i][1])
+            v_next = (out[next_j][0] - out[j][0], out[next_j][1] - out[j][1])
+
+            # Only collapse when this tiny edge is part of a nearly straight run.
+            if not (_is_colinear(v_prev, v_short) and _is_colinear(v_short, v_next)):
+                continue
+
+            del out[j]
+            changed = True
+            break
+    return out
+
+
 def _point_in_polygon(
     pt: tuple[float, float],
     poly: list[tuple[float, float]],
@@ -362,8 +415,9 @@ def _project_panel(
         min_x = frame.offset_x
         min_y = frame.offset_y
         pts_2d = [(_vec_dot(pt, u) - min_x, _vec_dot(pt, v) - min_y) for pt in outer_verts_3d]
+        pts_2d = _collapse_short_segments(pts_2d)
         holes_2d = [
-            [(_vec_dot(pt, u) - min_x, _vec_dot(pt, v) - min_y) for pt in verts]
+            _collapse_short_segments([(_vec_dot(pt, u) - min_x, _vec_dot(pt, v) - min_y) for pt in verts])
             for verts in hole_verts_3d
             if len(verts) >= 3
         ]
@@ -388,8 +442,9 @@ def _project_panel(
     min_x = min(p[0] for p in outline_rot)
     min_y = min(p[1] for p in outline_rot)
     pts_2d = [(p[0] - min_x, p[1] - min_y) for p in outline_rot]
+    pts_2d = _collapse_short_segments(pts_2d)
     holes_2d = [
-        [(p[0] - min_x, p[1] - min_y) for p in hole]
+        _collapse_short_segments([(p[0] - min_x, p[1] - min_y) for p in hole])
         for hole in holes_rot
         if len(hole) >= 3
     ]

@@ -168,10 +168,10 @@ def _match_source_edges_for_shared_edges(
     source_solid: cq.Shape,
     shared_edges: list[SharedEdge],
     line_tolerance: float = 1.5,
-) -> list[cq.Edge]:
+) -> list[tuple[cq.Edge, SharedEdge]]:
     """Match extracted shared-edge segments to line edges in the source solid."""
     source_edges = [e for e in source_solid.Edges() if e.geomType() == "LINE"]
-    matched: list[cq.Edge] = []
+    matched: list[tuple[cq.Edge, SharedEdge]] = []
     used: set[int] = set()
 
     for se in shared_edges:
@@ -212,7 +212,7 @@ def _match_source_edges_for_shared_edges(
         if best_overlap < min_overlap:
             continue
 
-        matched.append(source_edges[best_idx])
+        matched.append((source_edges[best_idx], se))
         used.add(best_idx)
 
     return matched
@@ -221,6 +221,7 @@ def _match_source_edges_for_shared_edges(
 def _make_finger_joint_faces_safe(
     shape: cq.Shape,
     finger_joint_edges: list[cq.Edge],
+    seam_by_edge: dict[cq.Edge, SharedEdge] | None,
     material_thickness: float,
     target_finger_width: float,
     kerf_width: float = 0.0,
@@ -300,12 +301,23 @@ def _make_finger_joint_faces_safe(
                     else:
                         open_internal_vertices[v] = {i}
 
-    corner_face_counter: dict[cq.Vertex, set[int]] = {}
     for common_edge, adjacent_face_indices in edge_adjacency.items():
+        corner_face_counter: dict[cq.Vertex, set[int]] = {}
         primary_face_index = adjacent_face_indices[0]
         secondary_face_index = adjacent_face_indices[1]
-        if working_face_areas[primary_face_index] > working_face_areas[secondary_face_index]:
-            primary_face_index, secondary_face_index = secondary_face_index, primary_face_index
+        reverse_align = False
+        if seam_by_edge is not None and common_edge in seam_by_edge:
+            se = seam_by_edge[common_edge]
+            # Keep this specific seam in the opposite phase to avoid a tiny
+            # corner part-finger that offsets the back_wall/right_wall mesh.
+            reverse_align = {se.panel_a, se.panel_b} == {"bottom", "back_wall"}
+
+        if reverse_align:
+            if working_face_areas[primary_face_index] < working_face_areas[secondary_face_index]:
+                primary_face_index, secondary_face_index = secondary_face_index, primary_face_index
+        else:
+            if working_face_areas[primary_face_index] > working_face_areas[secondary_face_index]:
+                primary_face_index, secondary_face_index = secondary_face_index, primary_face_index
 
         for i in [primary_face_index, secondary_face_index]:
             working_faces[i] = working_faces[i].makeFingerJoints(
@@ -359,13 +371,16 @@ def _apply_finger_joints_cqwarehouse(
             finger_seams.append(se)
 
     source_solid = _to_cuttable(model.source_solid)
-    joint_edges = _match_source_edges_for_shared_edges(source_solid, finger_seams)
+    matched_edge_seams = _match_source_edges_for_shared_edges(source_solid, finger_seams)
+    joint_edges = [edge for edge, _ in matched_edge_seams]
+    seam_by_edge = {edge: se for edge, se in matched_edge_seams}
     if not joint_edges:
         raise RuntimeError("No source edges matched shared seams for cq_warehouse")
 
     jointed_faces = _make_finger_joint_faces_safe(
         source_solid,
         joint_edges,
+        seam_by_edge=seam_by_edge,
         material_thickness=model.thickness,
         target_finger_width=finger_width,
         kerf_width=kerf,
@@ -735,6 +750,7 @@ def _inset_slot_intervals_from_lip(
     finger_width: float,
     start_keepout: float,
     end_keepout: float,
+    segment_end_trim: float = 3.5,
 ) -> list[tuple[float, float]]:
     """Find slot intervals where the slot-panel lip is full-depth (not notched).
 
@@ -798,6 +814,18 @@ def _inset_slot_intervals_from_lip(
         hi = min(hi, usable_hi)
         if hi - lo >= min_seg:
             clipped.append((lo, hi))
+
+    # Trim each segment's ends so tabs/slots stay clear of nearby notch valleys.
+    if segment_end_trim > 0:
+        trimmed: list[tuple[float, float]] = []
+        min_after_trim = max(8.0, finger_width * 0.45)
+        for lo, hi in clipped:
+            tlo = lo + segment_end_trim
+            thi = hi - segment_end_trim
+            if thi - tlo >= min_after_trim:
+                trimmed.append((tlo, thi))
+        if trimmed:
+            return trimmed
 
     return clipped
 
