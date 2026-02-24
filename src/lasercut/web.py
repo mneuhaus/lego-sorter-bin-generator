@@ -795,7 +795,7 @@ def _render_index(error: str | None = None) -> str:
               </div>
               <div>
                 <label class="label" for="pack_rotations">Pack Rotations</label>
-                <input id="pack_rotations" name="pack_rotations" type="number" min="1" step="1" value="2">
+                <input id="pack_rotations" name="pack_rotations" type="number" min="1" step="1" value="8">
               </div>
             </div>
           </div>
@@ -1207,7 +1207,7 @@ def generate_batch(
     sheet_height: str | None = Form(None),
     part_gap: float = Form(4.0),
     sheet_gap: float = Form(20.0),
-    pack_rotations: int = Form(2),
+    pack_rotations: int = Form(8),
 ) -> JSONResponse:
     if layout not in {"unfolded", "packed"}:
         raise HTTPException(status_code=400, detail="layout must be 'unfolded' or 'packed'")
@@ -1284,7 +1284,7 @@ def generate_single_legacy(
     sheet_height: str | None = Form(None),
     part_gap: float = Form(4.0),
     sheet_gap: float = Form(20.0),
-    pack_rotations: int = Form(2),
+    pack_rotations: int = Form(8),
 ) -> FileResponse:
     if layout not in {"unfolded", "packed"}:
         raise HTTPException(status_code=400, detail="layout must be 'unfolded' or 'packed'")
