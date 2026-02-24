@@ -907,6 +907,23 @@ def _render_index(error: str | None = None) -> str:
     const stepPreviewCache = new Map();
     let activePreviewStepFile = null;
     const stepCheckboxes = Array.from(document.querySelectorAll('input[name="step_files"]'));
+    const SETTINGS_KEY = 'lasercut.web.settings.v1';
+    const fingerWidthInput = document.getElementById('finger_width');
+    const thicknessInput = document.getElementById('thickness');
+    const kerfInput = document.getElementById('kerf');
+    const sheetWidthInput = document.getElementById('sheet_width');
+    const sheetHeightInput = document.getElementById('sheet_height');
+    const partGapInput = document.getElementById('part_gap');
+    const sheetGapInput = document.getElementById('sheet_gap');
+    const persistedInputs = [
+      fingerWidthInput,
+      thicknessInput,
+      kerfInput,
+      sheetWidthInput,
+      sheetHeightInput,
+      partGapInput,
+      sheetGapInput,
+    ];
 
     function syncLayout() {
       packedBlock.classList.toggle('visible', layoutSel.value === 'packed');
@@ -921,6 +938,69 @@ def _render_index(error: str | None = None) -> str:
       document.querySelectorAll('input[name="step_files"]').forEach((cb) => {
         cb.checked = checked;
       });
+    }
+
+    function _readStoredSettings() {
+      try {
+        const raw = window.localStorage.getItem(SETTINGS_KEY);
+        if (!raw) {
+          return null;
+        }
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function saveSettings() {
+      const payload = {
+        layout: layoutSel.value,
+        finger_width: fingerWidthInput ? fingerWidthInput.value : '',
+        thickness: thicknessInput ? thicknessInput.value : '',
+        kerf: kerfInput ? kerfInput.value : '',
+        sheet_width: sheetWidthInput ? sheetWidthInput.value : '',
+        sheet_height: sheetHeightInput ? sheetHeightInput.value : '',
+        part_gap: partGapInput ? partGapInput.value : '',
+        sheet_gap: sheetGapInput ? sheetGapInput.value : '',
+        step_files: selectedFiles(),
+      };
+      try {
+        window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(payload));
+      } catch (_) {}
+    }
+
+    function restoreSettings() {
+      const stored = _readStoredSettings();
+      if (!stored) {
+        return;
+      }
+
+      const applyTextValue = (el, key) => {
+        if (!el) {
+          return;
+        }
+        const value = stored[key];
+        if (typeof value === 'string') {
+          el.value = value;
+        }
+      };
+
+      applyTextValue(layoutSel, 'layout');
+      applyTextValue(fingerWidthInput, 'finger_width');
+      applyTextValue(thicknessInput, 'thickness');
+      applyTextValue(kerfInput, 'kerf');
+      applyTextValue(sheetWidthInput, 'sheet_width');
+      applyTextValue(sheetHeightInput, 'sheet_height');
+      applyTextValue(partGapInput, 'part_gap');
+      applyTextValue(sheetGapInput, 'sheet_gap');
+
+      if (Array.isArray(stored.step_files)) {
+        const wanted = new Set(stored.step_files.filter((item) => typeof item === 'string'));
+        stepCheckboxes.forEach((cb) => {
+          cb.checked = wanted.has(cb.value);
+        });
+      }
     }
 
     function clearViewer(canvas) {
@@ -1413,17 +1493,31 @@ def _render_index(error: str | None = None) -> str:
     selectAllBtn.addEventListener('click', () => {
       setAllStepCheckboxes(true);
       updateOriginPreview();
+      saveSettings();
     });
     selectNoneBtn.addEventListener('click', () => {
       setAllStepCheckboxes(false);
       updateOriginPreview();
+      saveSettings();
     });
     stepCheckboxes.forEach((cb) => {
       cb.addEventListener('change', () => {
         updateOriginPreview(cb.checked ? cb.value : null);
+        saveSettings();
       });
     });
-    layoutSel.addEventListener('change', syncLayout);
+    persistedInputs.forEach((el) => {
+      if (!el) {
+        return;
+      }
+      el.addEventListener('change', saveSettings);
+      el.addEventListener('input', saveSettings);
+    });
+    layoutSel.addEventListener('change', () => {
+      syncLayout();
+      saveSettings();
+    });
+    restoreSettings();
     syncLayout();
     updateOriginPreview();
   </script>
