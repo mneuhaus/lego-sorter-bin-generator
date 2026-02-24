@@ -8,6 +8,7 @@ so that finger-joint alignment can be visually verified.
 from __future__ import annotations
 
 import math
+from itertools import permutations
 from collections import deque
 from dataclasses import dataclass
 
@@ -623,6 +624,326 @@ def _compute_unfolded_layout(
 
 
 # ---------------------------------------------------------------------------
+# Packed layout (sheet nesting)
+# ---------------------------------------------------------------------------
+
+def _poly_area_abs(pts: list[tuple[float, float]]) -> float:
+    if len(pts) < 3:
+        return 0.0
+    acc = 0.0
+    for i in range(len(pts)):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % len(pts)]
+        acc += x1 * y2 - x2 * y1
+    return abs(acc) * 0.5
+
+
+def _bounds_xy(pts: list[tuple[float, float]]) -> tuple[float, float, float, float]:
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _bbox_distance(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+) -> float:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    dx = max(0.0, max(ax0 - bx1, bx0 - ax1))
+    dy = max(0.0, max(ay0 - by1, by0 - ay1))
+    return math.hypot(dx, dy)
+
+
+def _bbox_intersects(
+    a: tuple[float, float, float, float],
+    b: tuple[float, float, float, float],
+    eps: float = 1e-6,
+) -> bool:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    if ax1 <= bx0 + eps or bx1 <= ax0 + eps:
+        return False
+    if ay1 <= by0 + eps or by1 <= ay0 + eps:
+        return False
+    return True
+
+
+def _outline_poly(pts: list[tuple[float, float]]):
+    if Polygon is None or len(pts) < 3:
+        return None
+    try:
+        poly = Polygon(pts)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty or poly.area < 1e-6:
+            return None
+        return poly
+    except Exception:
+        return None
+
+
+def _candidate_points_for_sheet(
+    existing_bounds: list[tuple[float, float, float, float]],
+    margin: float,
+    part_gap: float,
+) -> list[tuple[float, float]]:
+    candidates: set[tuple[float, float]] = {(margin, margin)}
+    xs: set[float] = {margin}
+    ys: set[float] = {margin}
+    for min_x, min_y, max_x, max_y in existing_bounds:
+        candidates.add((max_x + part_gap, min_y))
+        candidates.add((min_x, max_y + part_gap))
+        candidates.add((max_x + part_gap, max_y + part_gap))
+        xs.add(min_x)
+        xs.add(max_x + part_gap)
+        ys.add(min_y)
+        ys.add(max_y + part_gap)
+
+    for x in xs:
+        for y in ys:
+            candidates.add((x, y))
+
+    return sorted(candidates, key=lambda p: (p[1], p[0]))
+
+
+def _make_oriented_geometry(
+    panel: Panel2D,
+    angle_rad: float,
+) -> dict[str, object]:
+    rot = Affine2D.from_rotation(angle_rad)
+    out_rot = rot.apply_pts(panel.outline)
+    holes_rot = [rot.apply_pts(h) for h in panel.holes]
+    min_x, min_y, max_x, max_y = _bounds_xy(out_rot)
+    out_norm = _translate_pts(out_rot, -min_x, -min_y)
+    holes_norm = [_translate_pts(h, -min_x, -min_y) for h in holes_rot]
+    return {
+        "outline": out_norm,
+        "holes": holes_norm,
+        "width": max_x - min_x,
+        "height": max_y - min_y,
+        "xform": Affine2D.from_translation(-min_x, -min_y).compose(rot),
+    }
+
+
+def _sheet_origins(
+    n_sheets: int,
+    sheet_width: float,
+    sheet_height: float,
+    sheet_gap: float,
+) -> list[tuple[float, float]]:
+    if n_sheets <= 0:
+        return []
+    cols = max(1, math.ceil(math.sqrt(n_sheets)))
+    origins: list[tuple[float, float]] = []
+    for idx in range(n_sheets):
+        col = idx % cols
+        row = idx // cols
+        origins.append((col * (sheet_width + sheet_gap), row * (sheet_height + sheet_gap)))
+    return origins
+
+
+def _compute_packed_layout(
+    panel_map: dict[str, Panel2D],
+    sheet_width: float,
+    sheet_height: float,
+    part_gap: float = 4.0,
+    sheet_gap: float = 15.0,
+    pack_rotations: int = 2,
+) -> tuple[
+    list[tuple[str, list[tuple[float, float]], list[list[tuple[float, float]]], Affine2D]],
+    list[tuple[float, float, float, float]],
+]:
+    """Pack flat panels into one or more fixed-size sheets.
+
+    Uses a bottom-left heuristic on candidate anchors and supports optional
+    part rotation steps (default: 0/90 degrees).
+    """
+    if sheet_width <= 0 or sheet_height <= 0:
+        raise ValueError("sheet_width and sheet_height must be > 0 for packed layout")
+
+    if pack_rotations <= 1:
+        angles = [0.0]
+    elif pack_rotations == 2:
+        angles = [0.0, math.pi / 2.0]
+    else:
+        step = 2.0 * math.pi / float(pack_rotations)
+        angles = [i * step for i in range(pack_rotations)]
+
+    oriented_by_name: dict[str, list[dict[str, object]]] = {}
+    for name, panel in panel_map.items():
+        variants: list[dict[str, object]] = []
+        for angle in angles:
+            g = _make_oriented_geometry(panel, angle)
+            width = float(g["width"])
+            height = float(g["height"])
+            if width <= sheet_width + 1e-6 and height <= sheet_height + 1e-6:
+                variants.append(g)
+        if not variants:
+            raise ValueError(
+                f"Panel '{name}' does not fit into the requested sheet size "
+                f"({sheet_width} x {sheet_height} mm)"
+            )
+        oriented_by_name[name] = variants
+
+    order = sorted(
+        panel_map.keys(),
+        key=lambda n: _poly_area_abs(panel_map[n].outline),
+        reverse=True,
+    )
+
+    edge_margin = 0.0
+
+    def _best_on_sheet(
+        sheet_states: list[dict[str, list]],
+        sheet_idx: int,
+        name: str,
+    ) -> dict[str, object] | None:
+        state = sheet_states[sheet_idx]
+        candidates = _candidate_points_for_sheet(state["bounds"], edge_margin, part_gap)
+        best: dict[str, object] | None = None
+        best_score: tuple[float, float, float, float] | None = None
+        occ_x = max((b[2] for b in state["bounds"]), default=0.0)
+        occ_y = max((b[3] for b in state["bounds"]), default=0.0)
+
+        def _try_position(x: float, y: float, orient: dict[str, object]) -> None:
+            nonlocal best, best_score
+            out = orient["outline"]  # type: ignore[assignment]
+            holes = orient["holes"]  # type: ignore[assignment]
+            w = float(orient["width"])
+            h = float(orient["height"])
+            if x < edge_margin - 1e-6 or y < edge_margin - 1e-6:
+                return
+            if x + w > sheet_width - edge_margin + 1e-6:
+                return
+            if y + h > sheet_height - edge_margin + 1e-6:
+                return
+
+            bounds = (x, y, x + w, y + h)
+            out_xy = _translate_pts(out, x, y)  # type: ignore[arg-type]
+            cand_poly = _outline_poly(out_xy)
+            if Polygon is not None and cand_poly is None:
+                return
+
+            for idx_existing, b in enumerate(state["bounds"]):
+                if not _bbox_intersects(bounds, b):
+                    if part_gap <= 0 or _bbox_distance(bounds, b) >= part_gap - 1e-6:
+                        continue
+                if Polygon is None:
+                    return
+                ex_poly = state["polys"][idx_existing]
+                if ex_poly is None:
+                    continue
+                if cand_poly.intersects(ex_poly):  # type: ignore[union-attr]
+                    return
+                if part_gap > 0 and cand_poly.distance(ex_poly) < part_gap - 1e-6:  # type: ignore[union-attr]
+                    return
+
+            holes_xy = [_translate_pts(hole, x, y) for hole in holes]  # type: ignore[arg-type]
+            xform = Affine2D.from_translation(x, y).compose(orient["xform"])  # type: ignore[arg-type]
+            new_occ_x = max(occ_x, x + w)
+            new_occ_y = max(occ_y, y + h)
+            score = (new_occ_x * new_occ_y, new_occ_y, new_occ_x, y)
+            if best_score is None or score < best_score:
+                best_score = score
+                best = {
+                    "name": name,
+                    "sheet_index": sheet_idx,
+                    "outline": out_xy,
+                    "holes": holes_xy,
+                    "xform": xform,
+                    "bounds": bounds,
+                    "poly": cand_poly,
+                }
+
+        # 1) Fast anchor candidates
+        for x, y in candidates:
+            for orient in oriented_by_name[name]:
+                _try_position(x, y, orient)
+
+        # 2) Dense scan fallback for irregular gaps (SheetPack-inspired)
+        if best is None:
+            step_sizes = [2.0, 1.0] if max(sheet_width, sheet_height) <= 1200 else [4.0, 2.0]
+            for step in step_sizes:
+                if best is not None:
+                    break
+                y = 0.0
+                while y <= sheet_height + 1e-6:
+                    x = 0.0
+                    while x <= sheet_width + 1e-6:
+                        for orient in oriented_by_name[name]:
+                            _try_position(x, y, orient)
+                        x += step
+                    y += step
+
+        return best
+
+    def _pack_with_order(order_names: list[str]) -> tuple[list[dict[str, object]], list[dict[str, list]]]:
+        sheet_states: list[dict[str, list]] = []
+        placements_local: list[dict[str, object]] = []
+
+        for name in order_names:
+            placed = None
+            for sheet_idx in range(len(sheet_states)):
+                cand = _best_on_sheet(sheet_states, sheet_idx, name)
+                if cand is not None:
+                    placed = cand
+                    break  # Prefer earliest existing sheet to minimize sheet count.
+
+            if placed is None:
+                sheet_states.append({"bounds": [], "polys": []})
+                placed = _best_on_sheet(sheet_states, len(sheet_states) - 1, name)
+                if placed is None:
+                    raise ValueError(
+                        f"Failed to place panel '{name}' on a new sheet "
+                        f"({sheet_width} x {sheet_height} mm)"
+                    )
+
+            sheet_idx = int(placed["sheet_index"])
+            sheet_states[sheet_idx]["bounds"].append(placed["bounds"])
+            sheet_states[sheet_idx]["polys"].append(placed["poly"])
+            placements_local.append(placed)
+
+        return placements_local, sheet_states
+
+    best_placements, best_sheets = _pack_with_order(order)
+
+    # Try additional deterministic orders (inspiration from SheetPack multi-attempt search).
+    if len(order) <= 6 and len(best_sheets) > 1:
+        fixed = [order[0]]
+        rest = order[1:]
+        for perm in permutations(rest):
+            trial_order = fixed + list(perm)
+            trial_placements, trial_sheets = _pack_with_order(trial_order)
+            if len(trial_sheets) < len(best_sheets):
+                best_placements, best_sheets = trial_placements, trial_sheets
+                if len(best_sheets) == 1:
+                    break
+
+    placements_local = best_placements
+    sheet_states = best_sheets
+
+    origins = _sheet_origins(len(sheet_states), sheet_width, sheet_height, sheet_gap)
+
+    placed_global: list[
+        tuple[str, list[tuple[float, float]], list[list[tuple[float, float]]], Affine2D]
+    ] = []
+    for placed in placements_local:
+        sheet_idx = int(placed["sheet_index"])
+        ox, oy = origins[sheet_idx]
+        out_g = _translate_pts(placed["outline"], ox, oy)  # type: ignore[arg-type]
+        holes_g = [_translate_pts(h, ox, oy) for h in placed["holes"]]  # type: ignore[arg-type]
+        xform_g = Affine2D.from_translation(ox, oy).compose(placed["xform"])  # type: ignore[arg-type]
+        placed_global.append((str(placed["name"]), out_g, holes_g, xform_g))
+
+    sheet_rects = [
+        (ox, oy, sheet_width, sheet_height)
+        for ox, oy in origins
+    ]
+    return placed_global, sheet_rects
+
+
+# ---------------------------------------------------------------------------
 # SVG export
 # ---------------------------------------------------------------------------
 
@@ -631,10 +952,18 @@ def export_svg(
     output_path: str,
     spacing: float = 5.0,
     reference_model: BinModel | None = None,
+    layout: str = "unfolded",
+    sheet_width: float | None = None,
+    sheet_height: float | None = None,
+    part_gap: float = 4.0,
+    sheet_gap: float = 15.0,
+    pack_rotations: int = 2,
 ) -> None:
     """Export all panels as flat 2D outlines into an SVG file.
 
-    Uses an unfolded layout with 4 mm gaps between adjacent panels.
+    Supported layouts:
+    - ``unfolded``: adjacency-preserving unfold with fixed seam gaps
+    - ``packed``: sheet nesting into one or more fixed-size sheets
     """
     if svgwrite is None:
         raise ImportError("svgwrite is required for SVG export (pip install svgwrite)")
@@ -648,12 +977,54 @@ def export_svg(
     if not panel_map:
         raise ValueError("No outlines could be projected")
 
-    placed = _compute_unfolded_layout(model, panel_map, gap=4.0)
+    sheet_rects: list[tuple[float, float, float, float]] = []
+    if layout == "packed":
+        if sheet_width is None or sheet_height is None:
+            raise ValueError("packed layout requires sheet_width and sheet_height")
+        placed, sheet_rects = _compute_packed_layout(
+            panel_map,
+            sheet_width=sheet_width,
+            sheet_height=sheet_height,
+            part_gap=max(0.0, part_gap),
+            sheet_gap=max(0.0, sheet_gap),
+            pack_rotations=max(1, int(pack_rotations)),
+        )
+    else:
+        placed = _compute_unfolded_layout(model, panel_map, gap=4.0)
+
     if not placed:
         raise ValueError("No panels could be placed")
 
     all_x = [p[0] for _, pts, _, _ in placed for p in pts]
     all_y = [p[1] for _, pts, _, _ in placed for p in pts]
+    for x, y, w, h in sheet_rects:
+        all_x.extend([x, x + w])
+        all_y.extend([y, y + h])
+
+    min_x = min(all_x)
+    min_y = min(all_y)
+    shift_x = -min_x + spacing if min_x < 0 else 0.0
+    shift_y = -min_y + spacing if min_y < 0 else 0.0
+    if shift_x > 0 or shift_y > 0:
+        placed = [
+            (
+                name,
+                _translate_pts(pts, shift_x, shift_y),
+                [_translate_pts(hole, shift_x, shift_y) for hole in holes],
+                Affine2D.from_translation(shift_x, shift_y).compose(xform),
+            )
+            for name, pts, holes, xform in placed
+        ]
+        sheet_rects = [
+            (x + shift_x, y + shift_y, w, h)
+            for x, y, w, h in sheet_rects
+        ]
+        all_x = [p[0] for _, pts, _, _ in placed for p in pts]
+        all_y = [p[1] for _, pts, _, _ in placed for p in pts]
+        for x, y, w, h in sheet_rects:
+            all_x.extend([x, x + w])
+            all_y.extend([y, y + h])
+
     total_w = max(all_x) + spacing
     total_h = max(all_y) + spacing
 
@@ -670,6 +1041,25 @@ def export_svg(
         fill="#FFFFFF",
         stroke="none",
     ))
+
+    if sheet_rects:
+        for idx, (x, y, w, h) in enumerate(sheet_rects):
+            dwg.add(dwg.rect(
+                insert=(x, y),
+                size=(w, h),
+                fill="none",
+                stroke="#B9B9B9",
+                stroke_width="0.15",
+                stroke_dasharray="2.0,1.5",
+            ))
+            dwg.add(dwg.text(
+                f"sheet {idx + 1}",
+                insert=(x + 2.5, y + 2.5),
+                text_anchor="start",
+                dominant_baseline="hanging",
+                font_size="3.2",
+                fill="#8A8A8A",
+            ))
 
     for name, pts, holes, xform in placed:
         if not pts:
