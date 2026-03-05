@@ -24,7 +24,7 @@ def main():
     parser.add_argument(
         "--living-hinge-angle",
         type=float,
-        default=45.0,
+        default=0.0,
         help=(
             "Use living-hinge slits instead of fingers on non-bottom seams below this "
             "angle in degrees (<= 0 disables)"
@@ -38,7 +38,7 @@ def main():
     )
     parser.add_argument(
         "--layout",
-        choices=["unfolded", "packed"],
+        choices=["unfolded", "exploded", "packed"],
         default="unfolded",
         help="Layout mode for SVG output",
     )

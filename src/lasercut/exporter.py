@@ -833,6 +833,7 @@ def _project_panel(
     wp = cq.Workplane().add(solid)
     faces = wp.faces().vals()
 
+    candidate_faces: list[cq.Face] = []
     best_face = None
     best_area = 0.0
     for f in faces:
@@ -843,19 +844,56 @@ def _project_panel(
         dot = n.x * outer_normal[0] + n.y * outer_normal[1] + n.z * outer_normal[2]
         if dot > 0.99:
             a = f.Area()
+            candidate_faces.append(f)
             if a > best_area:
                 best_area = a
                 best_face = f
     if best_face is None:
         return None
 
-    outer_wire = best_face.outerWire()
-    outer_verts_3d = _wire_vertices_3d(outer_wire)
-    if not outer_verts_3d:
-        return None
+    def _largest_polygon(geom):
+        if geom is None:
+            return None
+        if hasattr(geom, "geom_type") and geom.geom_type == "Polygon":
+            return geom
+        geoms = getattr(geom, "geoms", None)
+        if not geoms:
+            return None
+        polys = [g for g in geoms if getattr(g, "geom_type", "") == "Polygon"]
+        if not polys:
+            return None
+        return max(polys, key=lambda g: g.area)
 
-    hole_wires = list(best_face.innerWires())
-    hole_verts_3d = [_wire_vertices_3d(w) for w in hole_wires]
+    def _build_union_polygon(
+        u_axis: tuple[float, float, float],
+        v_axis: tuple[float, float, float],
+    ):
+        if Polygon is None or unary_union is None:
+            return None
+
+        polys = []
+        for face in candidate_faces:
+            outer_verts = _wire_vertices_3d(face.outerWire())
+            if len(outer_verts) < 3:
+                continue
+            outer = [(_vec_dot(pt, u_axis), _vec_dot(pt, v_axis)) for pt in outer_verts]
+            holes = []
+            for iw in list(face.innerWires()):
+                hv = _wire_vertices_3d(iw)
+                if len(hv) >= 3:
+                    holes.append([(_vec_dot(pt, u_axis), _vec_dot(pt, v_axis)) for pt in hv])
+            try:
+                poly = Polygon(outer, holes).buffer(0)
+            except Exception:
+                continue
+            if poly.is_empty or poly.area <= 1e-6:
+                continue
+            polys.append(poly)
+
+        if not polys:
+            return None
+        merged = unary_union(polys).buffer(0)
+        return _largest_polygon(merged)
 
     if frame is not None:
         # Project into an existing local frame so overlays align exactly.
@@ -863,6 +901,28 @@ def _project_panel(
         v = frame.v_axis
         min_x = frame.offset_x
         min_y = frame.offset_y
+        merged_poly = _build_union_polygon(u, v)
+        if merged_poly is not None:
+            pts_2d = [(x - min_x, y - min_y) for x, y in list(merged_poly.exterior.coords)]
+            pts_2d = _collapse_short_segments(pts_2d)
+            holes_2d = [
+                _collapse_short_segments([(x - min_x, y - min_y) for x, y in list(r.coords)])
+                for r in merged_poly.interiors
+            ]
+            holes_2d = _filter_boundary_touching_holes(pts_2d, holes_2d)
+            return Panel2D(
+                name=name, outline=pts_2d, holes=holes_2d,
+                u_axis=u, v_axis=v,
+                offset_x=min_x, offset_y=min_y,
+            )
+
+        # Fallback: single best face projection
+        outer_wire = best_face.outerWire()
+        outer_verts_3d = _wire_vertices_3d(outer_wire)
+        if not outer_verts_3d:
+            return None
+        hole_wires = list(best_face.innerWires())
+        hole_verts_3d = [_wire_vertices_3d(w) for w in hole_wires]
         pts_2d = [(_vec_dot(pt, u) - min_x, _vec_dot(pt, v) - min_y) for pt in outer_verts_3d]
         pts_2d = _collapse_short_segments(pts_2d)
         holes_2d = [
@@ -878,12 +938,23 @@ def _project_panel(
         )
 
     u, v = _build_local_axes(outer_normal)
-    raw_outline = [(_vec_dot(pt, u), _vec_dot(pt, v)) for pt in outer_verts_3d]
-    raw_holes = [
-        [(_vec_dot(pt, u), _vec_dot(pt, v)) for pt in verts]
-        for verts in hole_verts_3d
-        if len(verts) >= 3
-    ]
+    merged_poly = _build_union_polygon(u, v)
+    if merged_poly is not None:
+        raw_outline = list(merged_poly.exterior.coords)
+        raw_holes = [list(r.coords) for r in merged_poly.interiors]
+    else:
+        outer_wire = best_face.outerWire()
+        outer_verts_3d = _wire_vertices_3d(outer_wire)
+        if not outer_verts_3d:
+            return None
+        hole_wires = list(best_face.innerWires())
+        hole_verts_3d = [_wire_vertices_3d(w) for w in hole_wires]
+        raw_outline = [(_vec_dot(pt, u), _vec_dot(pt, v)) for pt in outer_verts_3d]
+        raw_holes = [
+            [(_vec_dot(pt, u), _vec_dot(pt, v)) for pt in verts]
+            for verts in hole_verts_3d
+            if len(verts) >= 3
+        ]
 
     rot = _min_bbox_angle(raw_outline)
     outline_rot = _rotate_pts(raw_outline, -rot)
@@ -1488,6 +1559,7 @@ def export_svg(
 
     Supported layouts:
     - ``unfolded``: adjacency-preserving unfold with fixed seam gaps
+    - ``exploded``: adjacency-preserving unfold with larger seam gaps
     - ``packed``: sheet nesting into one or more fixed-size sheets
     """
     if svgwrite is None:
@@ -1515,8 +1587,12 @@ def export_svg(
             sheet_gap=max(0.0, sheet_gap),
             pack_rotations=max(1, int(pack_rotations)),
         )
-    else:
+    elif layout == "exploded":
+        placed = _compute_unfolded_layout(model, panel_map, gap=max(20.0, part_gap))
+    elif layout == "unfolded":
         placed = _compute_unfolded_layout(model, panel_map, gap=4.0)
+    else:
+        raise ValueError("layout must be one of: unfolded, exploded, packed")
 
     if not placed:
         raise ValueError("No panels could be placed")

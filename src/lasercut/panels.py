@@ -460,6 +460,139 @@ def _best_shared_edge(
 
 
 # ---------------------------------------------------------------------------
+# Post-processing for stable semantic names
+# ---------------------------------------------------------------------------
+
+def _is_bottom_panel_name(name: str) -> bool:
+    return name == "bottom" or name.startswith("bottom_")
+
+
+def _is_non_front_wall_name(name: str) -> bool:
+    if _is_bottom_panel_name(name):
+        return False
+    if name == "front_wall" or name.startswith("front_wall_"):
+        return False
+    return name.endswith("_wall") or "_wall_" in name
+
+
+def _is_shared_edge_on_panel_boundary(
+    se: SharedEdge,
+    panel: Panel,
+    tolerance: float = 0.6,
+) -> bool:
+    """Return True when shared edge *se* lies on *panel* outer boundary."""
+    se_start = se.start_3d
+    se_end = se.end_3d
+    se_dir = _vec_sub(se_end, se_start)
+    se_len = _vec_len(se_dir)
+    if se_len < 1e-6:
+        return False
+    d_unit = (se_dir[0] / se_len, se_dir[1] / se_len, se_dir[2] / se_len)
+
+    intervals: list[tuple[float, float]] = []
+
+    for pe in panel.outer_edges:
+        p0, p1 = pe
+        if (
+            _point_to_line_dist(p0, se_start, se_end) > tolerance
+            or _point_to_line_dist(p1, se_start, se_end) > tolerance
+            or _point_to_line_dist(se_start, p0, p1) > tolerance
+            or _point_to_line_dist(se_end, p0, p1) > tolerance
+        ):
+            continue
+
+        t0 = _vec_dot(_vec_sub(p0, se_start), d_unit)
+        t1 = _vec_dot(_vec_sub(p1, se_start), d_unit)
+        lo = max(0.0, min(t0, t1))
+        hi = min(se_len, max(t0, t1))
+        if hi - lo > 0.1:
+            intervals.append((lo, hi))
+
+    if not intervals:
+        return False
+
+    intervals.sort()
+    merged = [intervals[0]]
+    for lo, hi in intervals[1:]:
+        if lo <= merged[-1][1] + 0.05:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+
+    overlap = sum(hi - lo for lo, hi in merged)
+    return overlap >= 0.25 * se_len
+
+
+def _apply_panel_name_map(
+    panels: dict[str, Panel],
+    shared_edges: list[SharedEdge],
+    mapping: dict[str, str],
+) -> dict[str, Panel]:
+    if not mapping:
+        return panels
+
+    renamed: dict[str, Panel] = {}
+    for key, panel in panels.items():
+        new_key = mapping.get(key, key)
+        panel.name = new_key
+        renamed[new_key] = panel
+
+    for se in shared_edges:
+        se.panel_a = mapping.get(se.panel_a, se.panel_a)
+        se.panel_b = mapping.get(se.panel_b, se.panel_b)
+
+    return renamed
+
+
+def _normalize_inset_back_wall_naming(
+    panels: dict[str, Panel],
+    shared_edges: list[SharedEdge],
+) -> dict[str, Panel]:
+    """Ensure ``back_wall`` always names the inset/lip wall against bottom."""
+    bottom_name = "bottom" if "bottom" in panels else next(
+        (name for name in panels if _is_bottom_panel_name(name)),
+        None,
+    )
+    if bottom_name is None or bottom_name not in panels:
+        return panels
+
+    inset_hits: list[tuple[float, str]] = []
+
+    for se in shared_edges:
+        other = None
+        if se.panel_a == bottom_name:
+            other = se.panel_b
+        elif se.panel_b == bottom_name:
+            other = se.panel_a
+        if other is None or other not in panels or not _is_non_front_wall_name(other):
+            continue
+
+        on_bottom = _is_shared_edge_on_panel_boundary(se, panels[bottom_name], tolerance=0.6)
+        on_other = _is_shared_edge_on_panel_boundary(se, panels[other], tolerance=0.6)
+        if (not on_bottom) and on_other:
+            inset_hits.append((se.edge_length, other))
+
+    if not inset_hits:
+        return panels
+
+    inset_hits.sort(key=lambda item: item[0], reverse=True)
+    inset_name = inset_hits[0][1]
+
+    if inset_name == "back_wall":
+        return panels
+
+    if "back_wall" in panels:
+        mapping = {
+            inset_name: "back_wall",
+            "back_wall": inset_name,
+        }
+    else:
+        mapping = {inset_name: "back_wall"}
+
+    return _apply_panel_name_map(panels, shared_edges, mapping)
+
+
+# ---------------------------------------------------------------------------
 # In-plane dimensions
 # ---------------------------------------------------------------------------
 
@@ -621,6 +754,7 @@ def load_step_panels(step_path: str, thickness: float = 3.2) -> BinModel:
 
     # Detect shared edges
     shared_edges = _find_shared_edges(panels)
+    panels = _normalize_inset_back_wall_naming(panels, shared_edges)
 
     source_solid = solids[0] if len(solids) == 1 else None
     return BinModel(
