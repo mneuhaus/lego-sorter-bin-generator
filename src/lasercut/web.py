@@ -22,22 +22,11 @@ from lasercut.joints import apply_finger_joints
 from lasercut.panels import load_step_panels
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        return default
-
-
 _JOB_LOCK = Lock()
 _JOB_INDEX: dict[str, dict[str, Any]] = {}
 _JOB_TTL_SECONDS = int(float(os.getenv("LASERCUT_WEB_JOB_TTL_SECONDS", "21600")))
 _JOB_MAX_WORKERS = max(1, int(float(os.getenv("LASERCUT_WEB_MAX_WORKERS", "4"))))
 _FIXED_PACK_ROTATIONS = 8
-_DEFAULT_LIVING_HINGE_ANGLE = _env_float("LASERCUT_LIVING_HINGE_ANGLE", 0.0)
 _PREVIEW_LOCK = Lock()
 _STEP_PREVIEW_CACHE: dict[str, dict[str, Any] | None] = {}
 
@@ -102,7 +91,7 @@ def _folder_and_filename(
         filename = f"{step_stem}-packed-{thickness_label}-{kerf_label}-{sw}x{sh}.svg"
     else:
         folder_name = f"bins_{thickness_label}_{kerf_label}"
-        filename = f"{step_stem}-{layout}-{thickness_label}-{kerf_label}.svg"
+        filename = f"{step_stem}-unfolded-{thickness_label}-{kerf_label}.svg"
 
     return folder_name, filename
 
@@ -225,12 +214,7 @@ def _generate_single_file(
 
     try:
         original_model = load_step_panels(str(step_path), thickness)
-        model = apply_finger_joints(
-            original_model,
-            finger_width=finger_width,
-            kerf=kerf,
-            living_hinge_angle_threshold_deg=_DEFAULT_LIVING_HINGE_ANGLE,
-        )
+        model = apply_finger_joints(original_model, finger_width=finger_width, kerf=kerf)
 
         folder_name, filename = _folder_and_filename(
             step_stem=step_path.stem,
@@ -906,7 +890,6 @@ def _render_index(error: str | None = None) -> str:
               <select id="layout" name="layout">
                 <option value="packed" selected>packed</option>
                 <option value="unfolded">unfolded</option>
-                <option value="exploded">exploded</option>
               </select>
             </div>
             <div>
@@ -1582,8 +1565,8 @@ def generate_batch(
     part_gap: float = Form(4.0),
     sheet_gap: float = Form(20.0),
 ) -> JSONResponse:
-    if layout not in {"unfolded", "exploded", "packed"}:
-        raise HTTPException(status_code=400, detail="layout must be 'unfolded', 'exploded' or 'packed'")
+    if layout not in {"unfolded", "packed"}:
+        raise HTTPException(status_code=400, detail="layout must be 'unfolded' or 'packed'")
 
     try:
         parsed_sheet_width = _parse_optional_float(sheet_width)
@@ -1623,8 +1606,8 @@ def generate_single_api(
     part_gap: float = Form(4.0),
     sheet_gap: float = Form(20.0),
 ) -> JSONResponse:
-    if layout not in {"unfolded", "exploded", "packed"}:
-        raise HTTPException(status_code=400, detail="layout must be 'unfolded', 'exploded' or 'packed'")
+    if layout not in {"unfolded", "packed"}:
+        raise HTTPException(status_code=400, detail="layout must be 'unfolded' or 'packed'")
 
     try:
         parsed_sheet_width = _parse_optional_float(sheet_width)
@@ -1789,8 +1772,8 @@ def generate_single_legacy(
     part_gap: float = Form(4.0),
     sheet_gap: float = Form(20.0),
 ) -> FileResponse:
-    if layout not in {"unfolded", "exploded", "packed"}:
-        raise HTTPException(status_code=400, detail="layout must be 'unfolded', 'exploded' or 'packed'")
+    if layout not in {"unfolded", "packed"}:
+        raise HTTPException(status_code=400, detail="layout must be 'unfolded' or 'packed'")
 
     try:
         parsed_sheet_width = _parse_optional_float(sheet_width)

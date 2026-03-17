@@ -18,6 +18,7 @@ from lasercut.panels import (
     BinModel,
     Panel,
     SharedEdge,
+    _clean_panel_face_for_back_lip,
     _extract_outer_wire_edges,
     _thicken_face_inward,
     _edge_overlap_length,
@@ -138,9 +139,26 @@ def _clone_panels(panels: dict[str, Panel]) -> dict[str, Panel]:
             width=p.width,
             height=p.height,
             outer_face=p.outer_face,
+            reference_solid=p.reference_solid,
+            export_additions=list(p.export_additions),
+            cleanup_plane_point=p.cleanup_plane_point,
+            cleanup_plane_normal=p.cleanup_plane_normal,
+            cleanup_keep_positive=p.cleanup_keep_positive,
+            debug_cut_lines=list(p.debug_cut_lines),
             outer_edges=list(p.outer_edges),
         )
     return cloned
+
+
+def _restore_export_additions(panels: dict[str, Panel]) -> None:
+    """Fuse deferred export-only geometry back onto cleaned join solids."""
+    for panel in panels.values():
+        if not panel.export_additions:
+            continue
+        solid = _to_cuttable(panel.solid)
+        for addition in panel.export_additions:
+            solid = _to_cuttable(solid.fuse(addition))
+        panel.solid = solid
 
 
 def _edge_endpoints(edge: cq.Edge) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
@@ -449,15 +467,29 @@ def _apply_finger_joints_cqwarehouse(
             used_faces.add(best_idx)
             face = jointed_faces[best_idx]
             base_panel = panels[name]
-            new_edges = _extract_outer_wire_edges(face)
-            new_solid = _thicken_face_inward(face, base_panel.outer_normal, model.thickness)
+            clean_face, new_edges = _clean_panel_face_for_back_lip(
+                base_panel.name,
+                face,
+                base_panel.outer_normal,
+                model.thickness,
+                cleanup_plane_point=base_panel.cleanup_plane_point,
+                cleanup_plane_normal=base_panel.cleanup_plane_normal,
+                cleanup_keep_positive=base_panel.cleanup_keep_positive,
+            )
+            new_solid = _thicken_face_inward(clean_face, base_panel.outer_normal, model.thickness)
             panels[name] = Panel(
                 name=base_panel.name,
                 solid=new_solid,
                 outer_normal=base_panel.outer_normal,
                 width=base_panel.width,
                 height=base_panel.height,
-                outer_face=face,
+                outer_face=clean_face,
+                reference_solid=base_panel.reference_solid,
+                export_additions=list(base_panel.export_additions),
+                cleanup_plane_point=base_panel.cleanup_plane_point,
+                cleanup_plane_normal=base_panel.cleanup_plane_normal,
+                cleanup_keep_positive=base_panel.cleanup_keep_positive,
+                debug_cut_lines=list(base_panel.debug_cut_lines),
                 outer_edges=new_edges,
             )
             matched_names.add(name)
@@ -503,6 +535,7 @@ def _apply_finger_joints_cqwarehouse(
         f"{len(hinge_seams)} living-hinge seams, "
         f"{trimmed_seams} side-trimmed seams)"
     )
+    _restore_export_additions(panels)
     return BinModel(
         panels=panels,
         shared_edges=model.shared_edges,
@@ -689,19 +722,6 @@ def _classify_joint_type(
     pa = panels[se.panel_a]
     pb = panels[se.panel_b]
 
-    # Single-side layouts: force long bottom<->back_wall seams to through-slots
-    # in the bottom plate. This keeps inset back-wall tabs/slots aligned and
-    # avoids phase drift on lip-notch geometries.
-    side_wall_count = int("right_wall" in panels) + int("left_wall" in panels)
-    is_single_side_layout = side_wall_count == 1
-    is_bottom_back_pair = (
-        (se.panel_a == "back_wall" and _is_bottom_panel_name(se.panel_b))
-        or (se.panel_b == "back_wall" and _is_bottom_panel_name(se.panel_a))
-    )
-    if is_single_side_layout and is_bottom_back_pair and se.edge_length >= 60.0:
-        slot_panel_name = se.panel_a if _is_bottom_panel_name(se.panel_a) else se.panel_b
-        return ("through_slot", slot_panel_name)
-
     on_boundary_a = _is_edge_on_boundary(se, pa, tolerance)
     on_boundary_b = _is_edge_on_boundary(se, pb, tolerance)
 
@@ -797,39 +817,6 @@ def _merge_intervals(intervals: list[tuple[float, float]], tol: float = 0.05) ->
         else:
             merged.append((lo, hi))
     return merged
-
-
-def _colinear_edge_intervals_on_line(
-    panel: Panel,
-    line_origin: tuple[float, float, float],
-    line_dir: tuple[float, float, float],
-    tolerance: float = 1.2,
-) -> list[tuple[float, float]]:
-    """Collect panel-edge intervals projected onto an infinite seam line."""
-    line_b = _add(line_origin, line_dir)
-    intervals: list[tuple[float, float]] = []
-
-    for p0, p1 in panel.outer_edges:
-        e = _vec_sub(p1, p0)
-        e_len = _vec_len(e)
-        if e_len < 0.2:
-            continue
-        e_dir = _normalize(e)
-        if abs(_vec_dot(e_dir, line_dir)) < 0.93:
-            continue
-
-        d0 = _point_to_line_dist(p0, line_origin, line_b)
-        d1 = _point_to_line_dist(p1, line_origin, line_b)
-        if d0 > tolerance and d1 > tolerance:
-            continue
-
-        t0 = _vec_dot(_vec_sub(p0, line_origin), line_dir)
-        t1 = _vec_dot(_vec_sub(p1, line_origin), line_dir)
-        lo, hi = (t0, t1) if t0 <= t1 else (t1, t0)
-        if hi - lo > 0.2:
-            intervals.append((lo, hi))
-
-    return _merge_intervals(intervals, tol=0.2)
 
 
 def _complement_intervals(
@@ -966,7 +953,7 @@ def _trim_side_wall_overhangs_against_back_wall(
     corners: list[tuple[tuple[float, float, float], set[str]]],
     thickness: float,
     kerf: float = 0.0,
-    end_trim: float = 8.0,
+    end_trim: float = 3.5,
 ) -> int:
     """Trim side-wall seam-end overhangs on back-wall joints.
 
@@ -978,9 +965,6 @@ def _trim_side_wall_overhangs_against_back_wall(
 
     trimmed_count = 0
     cut_width = max(0.2, thickness - kerf)
-    # Cut slightly across both sides of the seam line so tiny lip remnants
-    # on the "outside" side are removed as well.
-    seam_cross_overcut = max(0.8, thickness * 0.35)
 
     for se in shared_edges:
         side_name: str | None = None
@@ -1003,14 +987,13 @@ def _trim_side_wall_overhangs_against_back_wall(
         if trim_len < 0.6:
             continue
 
-        end_boxes: list[tuple[float, float]] = []  # (offset_along_edge, box_length)
-        # Start-end: extend one trim length past the seam start to remove tiny
-        # remnants that protrude beyond the nominal back-wall contact.
-        end_boxes.append((-trim_len, trim_len * 2.0))
-        # End-end: same treatment past seam end.
-        if seam_len > 0.1:
-            end_boxes.append((seam_len - trim_len, trim_len * 2.0))
-        if not end_boxes:
+        start_keepout, end_keepout = _corner_keepout_for_edge(se, corners, thickness)
+        offsets: list[float] = []
+        if start_keepout > 0:
+            offsets.append(0.0)
+        if end_keepout > 0:
+            offsets.append(seam_len - trim_len)
+        if not offsets:
             continue
 
         edge_dir = _normalize(seam_vec)
@@ -1022,35 +1005,18 @@ def _trim_side_wall_overhangs_against_back_wall(
         ))
 
         solid = _to_cuttable(side_panel.solid)
-        for offset, box_len in end_boxes:
+        for offset in offsets:
             origin = _add(seam_start, _scale(edge_dir, offset))
-            origin = _add(origin, _scale(in_plane, -seam_cross_overcut))
             trim_box = _make_oriented_box(
                 origin=origin,
                 x_dir=edge_dir,
                 y_dir=in_plane,
                 z_dir=into_side,
-                dx=box_len,
-                dy=cut_width + 2.0 * seam_cross_overcut,
+                dx=trim_len,
+                dy=cut_width,
                 dz=thickness * 2,
             )
             solid = _to_cuttable(solid.cut(trim_box))
-
-        # Remove tiny residual nubs right at the seam endpoints.
-        corner_size = max(1.2, min(3.2, thickness))
-        for pt in (seam_start, seam_end):
-            corner_origin = _add(pt, _scale(edge_dir, -corner_size * 0.5))
-            corner_origin = _add(corner_origin, _scale(in_plane, -corner_size * 0.5))
-            corner_box = _make_oriented_box(
-                origin=corner_origin,
-                x_dir=edge_dir,
-                y_dir=in_plane,
-                z_dir=into_side,
-                dx=corner_size,
-                dy=corner_size,
-                dz=thickness * 2,
-            )
-            solid = _to_cuttable(solid.cut(corner_box))
 
         side_panel.solid = solid
         trimmed_count += 1
@@ -1181,42 +1147,9 @@ def _apply_through_slot(
     if d_len < 1e-6:
         return
     edge_dir = _normalize(d)
-    original_slot_start = slot_start
-    expanded_range: tuple[float, float] | None = None
-    slot_line_intervals_abs: list[tuple[float, float]] = []
-
-    # Some inset seams are represented by only a short edge fragment.
-    # Expand those seams along colinear edge fragments to recover the
-    # full tabbed engagement range.
-    if slot_panel.name == "bottom" and wall_panel.name == "back_wall" and d_len < 40.0:
-        slot_intervals_line = _colinear_edge_intervals_on_line(
-            slot_panel,
-            original_slot_start,
-            edge_dir,
-            tolerance=max(1.2, thickness * 0.5),
-        )
-        slot_line_intervals_abs = slot_intervals_line
-        wall_intervals_line = _colinear_edge_intervals_on_line(
-            wall_panel,
-            original_slot_start,
-            edge_dir,
-            tolerance=max(1.8, thickness * 0.7),
-        )
-        if slot_intervals_line and wall_intervals_line:
-            lo = max(slot_intervals_line[0][0], wall_intervals_line[0][0])
-            hi = min(slot_intervals_line[-1][1], wall_intervals_line[-1][1])
-            if hi - lo > d_len + 10.0:
-                slot_start = _add(original_slot_start, _scale(edge_dir, lo))
-                slot_end = _add(original_slot_start, _scale(edge_dir, hi))
-                d = _vec_sub(slot_end, slot_start)
-                d_len = _vec_len(d)
-                expanded_range = (lo, hi)
 
     # Keepouts at corners
     start_keepout, end_keepout = _corner_keepout_for_edge(se, corners, thickness)
-    if expanded_range is not None:
-        start_keepout = 0.0
-        end_keepout = 0.0
 
     usable_start = start_keepout
     usable_end = d_len - end_keepout
@@ -1246,60 +1179,6 @@ def _apply_through_slot(
         end_keepout=end_keepout,
     )
 
-    # For long bottom<->back_wall seams on single-side bins, derive slot
-    # segments from the actual notch profile so tabs sit on the "material-rich"
-    # peaks, not in notch valleys.
-    side_wall_count = int("right_wall" in panels) + int("left_wall" in panels)
-    use_regular_back_slots = (
-        side_wall_count == 1
-        and slot_panel.name == "bottom"
-        and wall_panel.name == "back_wall"
-        and d_len >= 60.0
-    )
-    if use_regular_back_slots:
-        valley_intervals: list[tuple[float, float]] = []
-        if expanded_range is not None and slot_line_intervals_abs:
-            exp_lo, exp_hi = expanded_range
-            min_seg = max(0.6, thickness * 0.18)
-            for a, b in slot_line_intervals_abs:
-                lo = max(a, exp_lo)
-                hi = min(b, exp_hi)
-                if hi - lo > min_seg:
-                    valley_intervals.append((lo - exp_lo, hi - exp_lo))
-            valley_intervals = _merge_intervals(valley_intervals, tol=0.05)
-
-        selected_intervals: list[tuple[float, float]] = []
-        if valley_intervals:
-            # Use the full peak zones between valley contacts so tabs are
-            # clearly protruding where more outer material exists.
-            min_seg = max(2.0, thickness * 0.7)
-            # Keep a small safety margin from valley transitions.
-            edge_trim = max(0.8, thickness * 0.25)
-            peaks = _complement_intervals(0.0, d_len, valley_intervals, tol=0.05)
-            for lo, hi in peaks:
-                lo += edge_trim
-                hi -= edge_trim
-                if hi - lo >= min_seg:
-                    selected_intervals.append((lo, hi))
-            selected_intervals = _merge_intervals(selected_intervals, tol=0.05)
-        else:
-            # Fallback to regular alternating pattern when valley extraction fails.
-            finger_layout = _compute_finger_layout(
-                edge_length=d_len,
-                finger_width=finger_width,
-                start_keepout=start_keepout,
-                end_keepout=end_keepout,
-            )
-            selected_intervals = [
-                (off, off + wid)
-                for idx, (off, wid) in enumerate(finger_layout)
-                if idx % 2 == 0
-            ]
-            selected_intervals = _merge_intervals(selected_intervals, tol=0.05)
-
-        if selected_intervals:
-            slot_intervals = selected_intervals
-
     if not slot_intervals:
         # Fallback to one continuous slot if lip-based segmentation is unavailable.
         slot_intervals = [(usable_start, usable_end)]
@@ -1308,16 +1187,12 @@ def _apply_through_slot(
     cut_width = max(0.2, thickness - kerf)
 
     # Cut through-slot segments in the slot panel.
-    slot_inset = 0.0
-
     solid_slot = _to_cuttable(slot_panel.solid)
     for lo, hi in slot_intervals:
         slot_length = hi - lo
         if slot_length <= 0:
             continue
         slot_origin = _add(slot_start, _scale(edge_dir, lo))
-        if slot_inset > 0:
-            slot_origin = _add(slot_origin, _scale(slot_in_plane, slot_inset))
         slot_box = _make_oriented_box(
             origin=slot_origin,
             x_dir=edge_dir,
@@ -1333,11 +1208,6 @@ def _apply_through_slot(
 
     # Recess non-slot regions on the wall panel so only matching tabs remain.
     wall_start, wall_end = _project_edge_to_panel(se, wall_panel)
-    if expanded_range is not None:
-        lo, hi = expanded_range
-        wall_line_origin = _project_point_to_panel_plane(original_slot_start, wall_panel)
-        wall_start = _add(wall_line_origin, _scale(edge_dir, lo))
-        wall_end = _add(wall_line_origin, _scale(edge_dir, hi))
     wall_vec = _vec_sub(wall_end, wall_start)
     wall_len = _vec_len(wall_vec)
     if wall_len < 1e-6:
@@ -1361,27 +1231,10 @@ def _apply_through_slot(
         wall_usable_end,
         slot_intervals,
     )
-    cleanup_intervals: list[tuple[float, float]] = []
-    flatten_wall_baseline = False
-    # On inset back-wall seams we want protruding tabs on top of the original
-    # wall edge (not alternating inward cuts). Keep wall edge intact here.
-    if use_regular_back_slots:
-        flatten_wall_baseline = True
-        recess_intervals = []
+    if not recess_intervals:
+        return
 
     wall_in_plane = _edge_inward_direction(wall_panel, wall_start, wall_end)
-    # If seam expansion moved the construction line slightly outside the real
-    # wall boundary, keep track of that offset so fused tabs overlap for sure.
-    wall_seam_offset = 0.0
-    if expanded_range is not None:
-        actual_wall_start, actual_wall_end = _project_edge_to_panel(se, wall_panel)
-        actual_wall_dir = _normalize(_vec_sub(actual_wall_end, actual_wall_start))
-        if _vec_dot(actual_wall_dir, wall_dir) < 0:
-            actual_wall_start, actual_wall_end = actual_wall_end, actual_wall_start
-        wall_seam_offset = _vec_dot(
-            _vec_sub(actual_wall_start, wall_start),
-            wall_in_plane,
-        )
     into_wall = _normalize((
         -wall_panel.outer_normal[0],
         -wall_panel.outer_normal[1],
@@ -1389,97 +1242,25 @@ def _apply_through_slot(
     ))
 
     solid_wall = _to_cuttable(wall_panel.solid)
-    if recess_intervals:
-        boundary_overcut = 0.2
-        for lo, hi in recess_intervals:
-            cut_len = hi - lo
-            if cut_len <= 0:
-                continue
-            cut_origin = _add(wall_start, _scale(wall_dir, lo))
-            # Nudge outward across the seam boundary to avoid zero-width skins that
-            # can otherwise show up as stray "inner hole" loops in 2D projection.
-            cut_origin = _add(cut_origin, _scale(wall_in_plane, -boundary_overcut))
-            recess_box = _make_oriented_box(
-                origin=cut_origin,
-                x_dir=wall_dir,
-                y_dir=wall_in_plane,
-                z_dir=into_wall,
-                dx=cut_len,
-                dy=cut_width + 2.0 * boundary_overcut,
-                dz=thickness * 2,
-            )
-            solid_wall = _to_cuttable(solid_wall.cut(recess_box))
-
-    # Single-side inset back walls inherit a 1 mm notch residue from the
-    # original monolithic shell where the wall meets the notched back lip.
-    # Flatten the full seam back to the true baseline first, then fuse the
-    # large tabs on top of that clean edge.
-    if flatten_wall_baseline and wall_len > 0.2:
-        flatten_overcut = 0.05
-        flatten_depth = max(0.0, wall_seam_offset) + 0.12
-        if flatten_depth > 0.08:
-            flatten_origin = _add(wall_start, _scale(wall_in_plane, -flatten_overcut))
-            flatten_box = _make_oriented_box(
-                origin=flatten_origin,
-                x_dir=wall_dir,
-                y_dir=wall_in_plane,
-                z_dir=into_wall,
-                dx=wall_len,
-                dy=flatten_depth + 2.0 * flatten_overcut,
-                dz=thickness * 2.0,
-            )
-            solid_wall = _to_cuttable(solid_wall.cut(flatten_box))
-
-    # For inset bottom<->back seams, do a shallow cleanup pass between large tabs
-    # to remove tiny remnant bumps without creating deep negative slots.
-    if cleanup_intervals:
-        cleanup_overcut = 0.12
-        cleanup_depth = max(0.8, thickness * 0.35)
-        cleanup_reach = cleanup_depth + max(0.0, wall_seam_offset) + 0.2
-        min_cleanup_len = max(0.8, thickness * 0.25)
-        for lo, hi in cleanup_intervals:
-            cut_len = hi - lo
-            if cut_len < min_cleanup_len:
-                continue
-            clean_origin = _add(wall_start, _scale(wall_dir, lo))
-            clean_origin = _add(clean_origin, _scale(wall_in_plane, -cleanup_overcut))
-            clean_box = _make_oriented_box(
-                origin=clean_origin,
-                x_dir=wall_dir,
-                y_dir=wall_in_plane,
-                z_dir=into_wall,
-                dx=cut_len,
-                dy=cleanup_reach + 2.0 * cleanup_overcut,
-                dz=thickness * 2.0,
-            )
-            solid_wall = _to_cuttable(solid_wall.cut(clean_box))
-
-    # Slightly extend remaining tabs beyond the seam so they fully pass through
-    # the bottom panel thickness on inset back-wall seams.
-    if use_regular_back_slots:
-        # Build physically protruding tabs (beyond original outline) and
-        # overshoot into thickness for robust boolean fusion.
-        tab_depth = max(thickness * 2.0, thickness - max(0.0, kerf) + 2.0)
-        fuse_overlap = 0.8
-        z_overshoot = thickness * 0.5
-        inward_reach = tab_depth + max(0.0, wall_seam_offset) + fuse_overlap
-        for lo, hi in slot_intervals:
-            tab_len = hi - lo
-            if tab_len <= 0.2:
-                continue
-            tab_origin = _add(wall_start, _scale(wall_dir, lo))
-            tab_origin = _add(tab_origin, _scale(wall_in_plane, -tab_depth))
-            tab_origin = _add(tab_origin, _scale(into_wall, -z_overshoot))
-            tab_box = _make_oriented_box(
-                origin=tab_origin,
-                x_dir=wall_dir,
-                y_dir=wall_in_plane,
-                z_dir=into_wall,
-                dx=tab_len,
-                dy=inward_reach,
-                dz=thickness * 2.0,
-            )
-            solid_wall = _to_cuttable(solid_wall.fuse(tab_box))
+    boundary_overcut = 0.2
+    for lo, hi in recess_intervals:
+        cut_len = hi - lo
+        if cut_len <= 0:
+            continue
+        cut_origin = _add(wall_start, _scale(wall_dir, lo))
+        # Nudge outward across the seam boundary to avoid zero-width skins that
+        # can otherwise show up as stray "inner hole" loops in 2D projection.
+        cut_origin = _add(cut_origin, _scale(wall_in_plane, -boundary_overcut))
+        recess_box = _make_oriented_box(
+            origin=cut_origin,
+            x_dir=wall_dir,
+            y_dir=wall_in_plane,
+            z_dir=into_wall,
+            dx=cut_len,
+            dy=cut_width + 2.0 * boundary_overcut,
+            dz=thickness * 2,
+        )
+        solid_wall = _to_cuttable(solid_wall.cut(recess_box))
 
     wall_panel.solid = solid_wall
 
@@ -1512,7 +1293,16 @@ def apply_finger_joints(
     - negative kerf => looser fit
     """
     # Prefer topology-aware jointing from cq_warehouse when a source solid exists.
-    if model.source_solid is not None:
+    #
+    # Exception: if we already had to virtually split a back lip off the bottom
+    # for single-solid preprocessing, the source-solid topology no longer matches
+    # the cleaned join geometry. In that case the custom seam-based boolean path
+    # is more trustworthy than the monolithic cq_warehouse edge remap.
+    has_virtual_cleanup = any(
+        p.cleanup_plane_point is not None or p.export_additions
+        for p in model.panels.values()
+    )
+    if model.source_solid is not None and not has_virtual_cleanup:
         try:
             return _apply_finger_joints_cqwarehouse(
                 model,
@@ -1652,6 +1442,7 @@ def apply_finger_joints(
         kerf=kerf,
     )
 
+    _restore_export_additions(panels)
     return BinModel(
         panels=panels,
         shared_edges=model.shared_edges,

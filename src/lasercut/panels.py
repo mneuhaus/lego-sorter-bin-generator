@@ -6,9 +6,9 @@ import math
 from dataclasses import dataclass, field
 
 import cadquery as cq
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_MakePolygon
 from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
-from OCP.gp import gp_Vec
+from OCP.gp import gp_Pnt, gp_Vec
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopAbs import TopAbs_WIRE, TopAbs_EDGE, TopAbs_VERTEX
 from OCP.TopoDS import TopoDS
@@ -27,6 +27,14 @@ class Panel:
     width: float   # longer in-plane dimension
     height: float  # shorter in-plane dimension
     outer_face: cq.Face | None = None
+    reference_solid: cq.Shape | None = None
+    export_additions: list[cq.Shape] = field(default_factory=list)
+    cleanup_plane_point: tuple[float, float, float] | None = None
+    cleanup_plane_normal: tuple[float, float, float] | None = None
+    cleanup_keep_positive: bool | None = None
+    debug_cut_lines: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = field(
+        default_factory=list
+    )
     outer_edges: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = field(
         default_factory=list
     )
@@ -114,6 +122,381 @@ def _edge_overlap_length(
     if overlap_end <= overlap_start + 0.1:
         return 0.0
     return overlap_end - overlap_start
+
+
+def _build_plane_axes(
+    normal: tuple[float, float, float],
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Build orthonormal in-plane axes for a face normal."""
+    nx, ny, nz = normal
+    if abs(nx) < 0.9:
+        ref = (1.0, 0.0, 0.0)
+    else:
+        ref = (0.0, 1.0, 0.0)
+
+    u = _vec_cross(ref, normal)
+    u_len = _vec_len(u)
+    u = (u[0] / u_len, u[1] / u_len, u[2] / u_len)
+
+    v = _vec_cross(normal, u)
+    v_len = _vec_len(v)
+    v = (v[0] / v_len, v[1] / v_len, v[2] / v_len)
+    return u, v
+
+
+def _ordered_loop_from_edges(
+    edges: list[tuple[tuple[float, float, float], tuple[float, float, float]]],
+    tolerance: float = 0.5,
+) -> list[tuple[float, float, float]]:
+    """Reconstruct an ordered closed loop of vertices from unordered edge endpoints."""
+    if not edges:
+        return []
+
+    remaining = [tuple(edge) for edge in edges]
+    start, end = remaining.pop(0)
+    ordered = [start, end]
+
+    while remaining:
+        current = ordered[-1]
+        next_idx = None
+        next_pt = None
+        for idx, (a, b) in enumerate(remaining):
+            if _pt_dist(current, a) <= tolerance:
+                next_idx = idx
+                next_pt = b
+                break
+            if _pt_dist(current, b) <= tolerance:
+                next_idx = idx
+                next_pt = a
+                break
+        if next_idx is None or next_pt is None:
+            return []
+
+        remaining.pop(next_idx)
+        if _pt_dist(next_pt, ordered[0]) <= tolerance:
+            break
+        ordered.append(next_pt)
+
+    return ordered
+
+
+def _intersect_lines_2d(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+) -> tuple[float, float] | None:
+    """Return the intersection of two infinite 2D lines, or None if parallel."""
+    x1, y1 = p0
+    x2, y2 = p1
+    x3, y3 = p2
+    x4, y4 = p3
+
+    den = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if abs(den) < 1e-9:
+        return None
+
+    det1 = x1 * y2 - y1 * x2
+    det2 = x3 * y4 - y3 * x4
+    x = (det1 * (x3 - x4) - (x1 - x2) * det2) / den
+    y = (det1 * (y3 - y4) - (y1 - y2) * det2) / den
+    return (x, y)
+
+
+def _cleanup_short_step_runs_2d(
+    loop_2d: list[tuple[float, float]],
+    short_threshold: float,
+    total_run_threshold: float,
+) -> list[tuple[float, float]]:
+    """Collapse tiny step-like runs bounded by longer edges.
+
+    This is used to strip lip-residue fragments from single-solid wall faces
+    while leaving the larger true wall profile intact.
+    """
+    pts = list(loop_2d)
+    if len(pts) < 4:
+        return pts
+
+    changed = True
+    while changed and len(pts) >= 4:
+        changed = False
+        n = len(pts)
+
+        for shift in range(n):
+            rot = pts[shift:] + pts[:shift]
+            lens = [
+                math.hypot(
+                    rot[(i + 1) % n][0] - rot[i][0],
+                    rot[(i + 1) % n][1] - rot[i][1],
+                )
+                for i in range(n)
+            ]
+            if lens[0] <= short_threshold:
+                continue
+
+            run_edges = 0
+            run_total = 0.0
+            idx = 1
+            while idx < n - 1 and lens[idx] <= short_threshold:
+                run_total += lens[idx]
+                run_edges += 1
+                idx += 1
+                if run_total > total_run_threshold:
+                    break
+
+            if run_edges == 0 or run_total > total_run_threshold:
+                continue
+            if idx >= n - 1 or lens[idx] <= short_threshold:
+                continue
+
+            inter = _intersect_lines_2d(rot[0], rot[1], rot[run_edges + 1], rot[run_edges + 2])
+            if inter is None:
+                continue
+
+            if math.hypot(inter[0] - rot[1][0], inter[1] - rot[1][1]) > total_run_threshold * 3.0:
+                continue
+            if math.hypot(inter[0] - rot[run_edges + 1][0], inter[1] - rot[run_edges + 1][1]) > total_run_threshold * 3.0:
+                continue
+
+            pts = [rot[0], inter] + rot[run_edges + 2 :]
+            changed = True
+            break
+
+    return pts
+
+
+def _make_face_from_loop(
+    loop_3d: list[tuple[float, float, float]],
+) -> cq.Face | None:
+    """Build a planar face from an ordered 3D vertex loop."""
+    if len(loop_3d) < 3:
+        return None
+
+    poly = BRepBuilderAPI_MakePolygon()
+    for pt in loop_3d:
+        poly.Add(gp_Pnt(pt[0], pt[1], pt[2]))
+    poly.Close()
+    if not poly.IsDone():
+        return None
+
+    face = BRepBuilderAPI_MakeFace(poly.Wire(), True).Face()
+    return cq.Face(face)
+
+
+def _plane_signed_distance(
+    pt: tuple[float, float, float],
+    plane_point: tuple[float, float, float],
+    plane_normal: tuple[float, float, float],
+) -> float:
+    return _vec_dot(_vec_sub(pt, plane_point), plane_normal)
+
+
+def _segment_plane_intersection(
+    a: tuple[float, float, float],
+    b: tuple[float, float, float],
+    da: float,
+    db: float,
+) -> tuple[float, float, float] | None:
+    denom = da - db
+    if abs(denom) < 1e-9:
+        return None
+    t = da / denom
+    return (
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+    )
+
+
+def _clip_loop_against_halfspace(
+    loop_3d: list[tuple[float, float, float]],
+    plane_point: tuple[float, float, float],
+    plane_normal: tuple[float, float, float],
+    keep_positive: bool,
+    tolerance: float = 1e-6,
+) -> list[tuple[float, float, float]]:
+    """Clip a planar polygon loop against a half-space."""
+    if len(loop_3d) < 3:
+        return []
+
+    def _inside(dist: float) -> bool:
+        return dist >= -tolerance if keep_positive else dist <= tolerance
+
+    out: list[tuple[float, float, float]] = []
+    n = len(loop_3d)
+    for i in range(n):
+        cur = loop_3d[i]
+        nxt = loop_3d[(i + 1) % n]
+        d_cur = _plane_signed_distance(cur, plane_point, plane_normal)
+        d_nxt = _plane_signed_distance(nxt, plane_point, plane_normal)
+        cur_in = _inside(d_cur)
+        nxt_in = _inside(d_nxt)
+
+        if cur_in and (not out or _pt_dist(out[-1], cur) > 1e-6):
+            out.append(cur)
+
+        if cur_in != nxt_in:
+            inter = _segment_plane_intersection(cur, nxt, d_cur, d_nxt)
+            if inter is not None and (not out or _pt_dist(out[-1], inter) > 1e-6):
+                out.append(inter)
+
+    if len(out) >= 2 and _pt_dist(out[0], out[-1]) <= 1e-6:
+        out.pop()
+
+    deduped: list[tuple[float, float, float]] = []
+    for pt in out:
+        if not deduped or _pt_dist(deduped[-1], pt) > 1e-6:
+            deduped.append(pt)
+    if len(deduped) >= 2 and _pt_dist(deduped[0], deduped[-1]) <= 1e-6:
+        deduped.pop()
+    return deduped
+
+
+def _clip_face_to_halfspace(
+    face: cq.Face,
+    plane_point: tuple[float, float, float],
+    plane_normal: tuple[float, float, float],
+    keep_positive: bool,
+) -> cq.Face | None:
+    raw_edges = _extract_outer_wire_edges(face)
+    loop_3d = _ordered_loop_from_edges(raw_edges)
+    if len(loop_3d) < 3:
+        return None
+
+    clipped_loop = _clip_loop_against_halfspace(
+        loop_3d,
+        plane_point,
+        plane_normal,
+        keep_positive,
+    )
+    if len(clipped_loop) < 3:
+        return None
+    return _make_face_from_loop(clipped_loop)
+
+
+def _plane_cut_segment_on_face(
+    face: cq.Face,
+    plane_point: tuple[float, float, float],
+    plane_normal: tuple[float, float, float],
+    tolerance: float = 1e-6,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
+    """Return the main segment where a face loop intersects a plane."""
+    raw_edges = _extract_outer_wire_edges(face)
+    loop_3d = _ordered_loop_from_edges(raw_edges)
+    if len(loop_3d) < 3:
+        return None
+
+    pts: list[tuple[float, float, float]] = []
+    n = len(loop_3d)
+    for i in range(n):
+        cur = loop_3d[i]
+        nxt = loop_3d[(i + 1) % n]
+        d_cur = _plane_signed_distance(cur, plane_point, plane_normal)
+        d_nxt = _plane_signed_distance(nxt, plane_point, plane_normal)
+
+        if abs(d_cur) <= tolerance:
+            pts.append(cur)
+        if d_cur * d_nxt < -tolerance * tolerance:
+            inter = _segment_plane_intersection(cur, nxt, d_cur, d_nxt)
+            if inter is not None:
+                pts.append(inter)
+        elif abs(d_nxt) <= tolerance:
+            pts.append(nxt)
+
+    deduped: list[tuple[float, float, float]] = []
+    for pt in pts:
+        if all(_pt_dist(pt, other) > 1e-4 for other in deduped):
+            deduped.append(pt)
+
+    if len(deduped) < 2:
+        return None
+
+    best_pair: tuple[tuple[float, float, float], tuple[float, float, float]] | None = None
+    best_len = 0.0
+    for i, a in enumerate(deduped):
+        for b in deduped[i + 1 :]:
+            seg_len = _pt_dist(a, b)
+            if seg_len > best_len:
+                best_len = seg_len
+                best_pair = (a, b)
+    return best_pair
+
+
+def _clean_panel_face_for_back_lip(
+    name: str,
+    face: cq.Face,
+    outer_normal: tuple[float, float, float],
+    thickness: float,
+    cleanup_plane_point: tuple[float, float, float] | None = None,
+    cleanup_plane_normal: tuple[float, float, float] | None = None,
+    cleanup_keep_positive: bool | None = None,
+) -> tuple[cq.Face, list[tuple[tuple[float, float, float], tuple[float, float, float]]]]:
+    """Strip short lip-residue spur geometry from single-solid wall faces.
+
+    The notch lip belongs to the bottom export geometry. For wall/joint logic,
+    we collapse tiny step fragments that come from the lip extending past the
+    back-wall seam in a monolithic shell export.
+    """
+    if (
+        cleanup_plane_point is not None
+        and cleanup_plane_normal is not None
+        and cleanup_keep_positive is not None
+        and name != "back_wall"
+    ):
+        clipped_face = _clip_face_to_halfspace(
+            face,
+            cleanup_plane_point,
+            cleanup_plane_normal,
+            cleanup_keep_positive,
+        )
+        if clipped_face is not None:
+            clipped_edges = _extract_outer_wire_edges(clipped_face)
+            if clipped_edges:
+                return clipped_face, clipped_edges
+
+    if name not in {"back_wall", "right_wall", "left_wall"}:
+        edges = _extract_outer_wire_edges(face)
+        return face, edges
+
+    raw_edges = _extract_outer_wire_edges(face)
+    loop_3d = _ordered_loop_from_edges(raw_edges)
+    if len(loop_3d) < 4:
+        return face, raw_edges
+
+    origin = loop_3d[0]
+    u_axis, v_axis = _build_plane_axes(outer_normal)
+    loop_2d = [
+        (
+            _vec_dot(_vec_sub(pt, origin), u_axis),
+            _vec_dot(_vec_sub(pt, origin), v_axis),
+        )
+        for pt in loop_3d
+    ]
+
+    cleaned_2d = _cleanup_short_step_runs_2d(
+        loop_2d,
+        short_threshold=max(1.0, thickness * 2.8),
+        total_run_threshold=max(2.0, thickness * 3.6),
+    )
+    if len(cleaned_2d) >= len(loop_2d):
+        return face, raw_edges
+
+    cleaned_3d = [
+        (
+            origin[0] + u_axis[0] * x + v_axis[0] * y,
+            origin[1] + u_axis[1] * x + v_axis[1] * y,
+            origin[2] + u_axis[2] * x + v_axis[2] * y,
+        )
+        for x, y in cleaned_2d
+    ]
+    cleaned_face = _make_face_from_loop(cleaned_3d)
+    if cleaned_face is None:
+        return face, raw_edges
+
+    cleaned_edges = _extract_outer_wire_edges(cleaned_face)
+    if not cleaned_edges:
+        return face, raw_edges
+    return cleaned_face, cleaned_edges
 
 
 # ---------------------------------------------------------------------------
@@ -460,139 +843,6 @@ def _best_shared_edge(
 
 
 # ---------------------------------------------------------------------------
-# Post-processing for stable semantic names
-# ---------------------------------------------------------------------------
-
-def _is_bottom_panel_name(name: str) -> bool:
-    return name == "bottom" or name.startswith("bottom_")
-
-
-def _is_non_front_wall_name(name: str) -> bool:
-    if _is_bottom_panel_name(name):
-        return False
-    if name == "front_wall" or name.startswith("front_wall_"):
-        return False
-    return name.endswith("_wall") or "_wall_" in name
-
-
-def _is_shared_edge_on_panel_boundary(
-    se: SharedEdge,
-    panel: Panel,
-    tolerance: float = 0.6,
-) -> bool:
-    """Return True when shared edge *se* lies on *panel* outer boundary."""
-    se_start = se.start_3d
-    se_end = se.end_3d
-    se_dir = _vec_sub(se_end, se_start)
-    se_len = _vec_len(se_dir)
-    if se_len < 1e-6:
-        return False
-    d_unit = (se_dir[0] / se_len, se_dir[1] / se_len, se_dir[2] / se_len)
-
-    intervals: list[tuple[float, float]] = []
-
-    for pe in panel.outer_edges:
-        p0, p1 = pe
-        if (
-            _point_to_line_dist(p0, se_start, se_end) > tolerance
-            or _point_to_line_dist(p1, se_start, se_end) > tolerance
-            or _point_to_line_dist(se_start, p0, p1) > tolerance
-            or _point_to_line_dist(se_end, p0, p1) > tolerance
-        ):
-            continue
-
-        t0 = _vec_dot(_vec_sub(p0, se_start), d_unit)
-        t1 = _vec_dot(_vec_sub(p1, se_start), d_unit)
-        lo = max(0.0, min(t0, t1))
-        hi = min(se_len, max(t0, t1))
-        if hi - lo > 0.1:
-            intervals.append((lo, hi))
-
-    if not intervals:
-        return False
-
-    intervals.sort()
-    merged = [intervals[0]]
-    for lo, hi in intervals[1:]:
-        if lo <= merged[-1][1] + 0.05:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-        else:
-            merged.append((lo, hi))
-
-    overlap = sum(hi - lo for lo, hi in merged)
-    return overlap >= 0.25 * se_len
-
-
-def _apply_panel_name_map(
-    panels: dict[str, Panel],
-    shared_edges: list[SharedEdge],
-    mapping: dict[str, str],
-) -> dict[str, Panel]:
-    if not mapping:
-        return panels
-
-    renamed: dict[str, Panel] = {}
-    for key, panel in panels.items():
-        new_key = mapping.get(key, key)
-        panel.name = new_key
-        renamed[new_key] = panel
-
-    for se in shared_edges:
-        se.panel_a = mapping.get(se.panel_a, se.panel_a)
-        se.panel_b = mapping.get(se.panel_b, se.panel_b)
-
-    return renamed
-
-
-def _normalize_inset_back_wall_naming(
-    panels: dict[str, Panel],
-    shared_edges: list[SharedEdge],
-) -> dict[str, Panel]:
-    """Ensure ``back_wall`` always names the inset/lip wall against bottom."""
-    bottom_name = "bottom" if "bottom" in panels else next(
-        (name for name in panels if _is_bottom_panel_name(name)),
-        None,
-    )
-    if bottom_name is None or bottom_name not in panels:
-        return panels
-
-    inset_hits: list[tuple[float, str]] = []
-
-    for se in shared_edges:
-        other = None
-        if se.panel_a == bottom_name:
-            other = se.panel_b
-        elif se.panel_b == bottom_name:
-            other = se.panel_a
-        if other is None or other not in panels or not _is_non_front_wall_name(other):
-            continue
-
-        on_bottom = _is_shared_edge_on_panel_boundary(se, panels[bottom_name], tolerance=0.6)
-        on_other = _is_shared_edge_on_panel_boundary(se, panels[other], tolerance=0.6)
-        if (not on_bottom) and on_other:
-            inset_hits.append((se.edge_length, other))
-
-    if not inset_hits:
-        return panels
-
-    inset_hits.sort(key=lambda item: item[0], reverse=True)
-    inset_name = inset_hits[0][1]
-
-    if inset_name == "back_wall":
-        return panels
-
-    if "back_wall" in panels:
-        mapping = {
-            inset_name: "back_wall",
-            "back_wall": inset_name,
-        }
-    else:
-        mapping = {inset_name: "back_wall"}
-
-    return _apply_panel_name_map(panels, shared_edges, mapping)
-
-
-# ---------------------------------------------------------------------------
 # In-plane dimensions
 # ---------------------------------------------------------------------------
 
@@ -609,23 +859,7 @@ def _compute_in_plane_dims(
         return (0.0, 0.0)
 
     # Build a local 2D coordinate system on the plane
-    nx, ny, nz = normal
-
-    # Pick an arbitrary axis not parallel to normal
-    if abs(nx) < 0.9:
-        ref = (1, 0, 0)
-    else:
-        ref = (0, 1, 0)
-
-    # u = ref x normal (normalized)
-    u = _vec_cross(ref, normal)
-    u_len = _vec_len(u)
-    u = (u[0] / u_len, u[1] / u_len, u[2] / u_len)
-
-    # v = normal x u
-    v = _vec_cross(normal, u)
-    v_len = _vec_len(v)
-    v = (v[0] / v_len, v[1] / v_len, v[2] / v_len)
+    u, v = _build_plane_axes(normal)
 
     # Project all points
     us = []
@@ -735,26 +969,94 @@ def load_step_panels(step_path: str, thickness: float = 3.2) -> BinModel:
     # Assign unique names
     names = _name_panels(bodies_data)
 
+    cleanup_plane_point: tuple[float, float, float] | None = None
+    cleanup_plane_normal: tuple[float, float, float] | None = None
+    cleanup_keep_positive: bool | None = None
+    lip_additions: dict[str, list[cq.Shape]] = {}
+    debug_cut_lines: dict[str, list[tuple[tuple[float, float, float], tuple[float, float, float]]]] = {}
+
+    if len(solids) == 1 and "bottom" in names and "back_wall" in names:
+        named_bodies = {name: bd for bd, name in zip(bodies_data, names)}
+        back_face = named_bodies["back_wall"]["outer_face"]
+        back_center = back_face.Center()
+        cleanup_plane_point = (back_center.x, back_center.y, back_center.z)
+        cleanup_plane_normal = named_bodies["back_wall"]["outer_normal"]
+
+        bottom_face = named_bodies["bottom"]["outer_face"]
+        bottom_center = bottom_face.Center()
+        bottom_signed = _plane_signed_distance(
+            (bottom_center.x, bottom_center.y, bottom_center.z),
+            cleanup_plane_point,
+            cleanup_plane_normal,
+        )
+        cleanup_keep_positive = bottom_signed >= 0.0
+
+        lip_face = _clip_face_to_halfspace(
+            bottom_face,
+            cleanup_plane_point,
+            cleanup_plane_normal,
+            not cleanup_keep_positive,
+        )
+        if lip_face is not None:
+            lip_additions["bottom"] = [
+                _thicken_face_inward(
+                    lip_face,
+                    named_bodies["bottom"]["outer_normal"],
+                    thickness,
+                )
+            ]
+            cut_segment = _plane_cut_segment_on_face(
+                bottom_face,
+                cleanup_plane_point,
+                cleanup_plane_normal,
+            )
+            if cut_segment is not None:
+                debug_cut_lines["bottom"] = [cut_segment]
+
     # Build Panel objects with thickened solids
     panels: dict[str, Panel] = {}
     for bd, name in zip(bodies_data, names):
-        thickened = _thicken_face_inward(
-            bd["outer_face"], bd["outer_normal"], thickness
+        raw_face = bd["outer_face"]
+        raw_edges = bd["edges"]
+        reference_solid = _thicken_face_inward(
+            raw_face, bd["outer_normal"], thickness
         )
-        w, h = _compute_in_plane_dims(bd["edges"], bd["outer_normal"])
+
+        clean_face = raw_face
+        clean_edges = raw_edges
+        if len(solids) == 1:
+            clean_face, clean_edges = _clean_panel_face_for_back_lip(
+                name,
+                raw_face,
+                bd["outer_normal"],
+                thickness,
+                cleanup_plane_point=cleanup_plane_point,
+                cleanup_plane_normal=cleanup_plane_normal,
+                cleanup_keep_positive=cleanup_keep_positive,
+            )
+
+        thickened = _thicken_face_inward(
+            clean_face, bd["outer_normal"], thickness
+        )
+        w, h = _compute_in_plane_dims(clean_edges, bd["outer_normal"])
         panels[name] = Panel(
             name=name,
             solid=thickened,
             outer_normal=bd["outer_normal"],
             width=w,
             height=h,
-            outer_face=bd["outer_face"],
-            outer_edges=bd["edges"],
+            outer_face=clean_face,
+            reference_solid=reference_solid,
+            export_additions=list(lip_additions.get(name, [])),
+            cleanup_plane_point=cleanup_plane_point,
+            cleanup_plane_normal=cleanup_plane_normal,
+            cleanup_keep_positive=cleanup_keep_positive,
+            debug_cut_lines=list(debug_cut_lines.get(name, [])),
+            outer_edges=clean_edges,
         )
 
     # Detect shared edges
     shared_edges = _find_shared_edges(panels)
-    panels = _normalize_inset_back_wall_naming(panels, shared_edges)
 
     source_solid = solids[0] if len(solids) == 1 else None
     return BinModel(
