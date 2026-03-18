@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from dataclasses import dataclass, replace
+from typing import Any
 
 import cadquery as cq
 
 from lasercut.exporter import (
     Affine2D,
+    Polygon,
     _project_panel,
     _compute_unfolded_layout,
     _translate_pts,
@@ -27,6 +30,7 @@ from lasercut.joints import (
 from lasercut.panels import (
     BinModel,
     Panel,
+    SharedEdge,
     _compute_in_plane_dims,
     _edge_overlap_length,
     _extract_outer_wire_edges,
@@ -169,6 +173,49 @@ def _build_inner_raw_model(model: BinModel) -> BinModel:
         shared_edges=model.shared_edges,
         thickness=model.thickness,
         source_solid=model.source_solid,
+        living_hinge_seams=model.living_hinge_seams,
+    )
+
+
+def _build_join_interface_model(model: BinModel) -> BinModel:
+    """Build a seam-domain model using the inner/opposite face for every panel.
+
+    This creates a consistent interface domain for seam reasoning. Unlike stage 00,
+    the bottom panel also uses its inner face here so bottom-to-wall seams can be
+    compared on the same side of the original stock thickness.
+    """
+    interface_panels: dict[str, Panel] = {}
+    for name, panel in model.panels.items():
+        found = _find_inner_face_for_panel(model, panel)
+        if found is None:
+            interface_panels[name] = _clone_panel_with_solid(
+                panel,
+                panel.reference_solid if panel.reference_solid is not None else panel.solid,
+            )
+            continue
+
+        inner_face, inner_normal = found
+        inner_solid = _thicken_face_inward(inner_face, inner_normal, model.thickness)
+        inner_edges = _extract_outer_wire_edges(inner_face)
+        width, height = _compute_in_plane_dims(inner_edges, inner_normal)
+        interface_panels[name] = replace(
+            panel,
+            solid=inner_solid,
+            outer_normal=inner_normal,
+            width=width,
+            height=height,
+            outer_face=inner_face,
+            outer_edges=inner_edges,
+            reference_solid=panel.reference_solid,
+            export_additions=[],
+            debug_cut_lines=[],
+        )
+
+    return BinModel(
+        panels=interface_panels,
+        shared_edges=_find_shared_edges(interface_panels),
+        thickness=model.thickness,
+        source_solid=None,
         living_hinge_seams=model.living_hinge_seams,
     )
 
@@ -478,6 +525,450 @@ def _draw_model_stage(
     dwg.save()
 
 
+def _polygon_from_outline_holes(
+    outline: list[tuple[float, float]],
+    holes: list[list[tuple[float, float]]],
+):
+    if Polygon is None or len(outline) < 3:
+        return None
+    try:
+        poly = Polygon(outline, holes)
+        if not poly.is_valid:
+            poly = poly.buffer(0)
+        if poly.is_empty:
+            return None
+        return poly
+    except Exception:
+        return None
+
+
+def _choose_pair_alignment_transform(
+    panel_a_name: str,
+    panel_b_name: str,
+    seam: SharedEdge,
+    panel_map: dict[str, Any],
+    ref_panel_map: dict[str, Any],
+) -> tuple[list[tuple[float, float]], list[list[tuple[float, float]]], Affine2D] | None:
+    pa = panel_map[panel_a_name]
+    pb = panel_map[panel_b_name]
+    pa_ref = ref_panel_map[panel_a_name]
+    pb_ref = ref_panel_map[panel_b_name]
+
+    a0 = pa.project_3d(seam.start_3d)
+    a1 = pa.project_3d(seam.end_3d)
+    b0 = pb.project_3d(seam.start_3d)
+    b1 = pb.project_3d(seam.end_3d)
+
+    adx = a1[0] - a0[0]
+    ady = a1[1] - a0[1]
+    bdx = b1[0] - b0[0]
+    bdy = b1[1] - b0[1]
+    if (adx * adx + ady * ady) < 1e-9 or (bdx * bdx + bdy * bdy) < 1e-9:
+        return None
+
+    angle_a = math.atan2(ady, adx)
+    angle_b = math.atan2(bdy, bdx)
+    seam_mid_a = ((a0[0] + a1[0]) / 2.0, (a0[1] + a1[1]) / 2.0)
+    seam_mid_b = ((b0[0] + b1[0]) / 2.0, (b0[1] + b1[1]) / 2.0)
+
+    poly_a_ref = _polygon_from_outline_holes(list(pa_ref.outline), [list(h) for h in pa_ref.holes])
+    if poly_a_ref is None:
+        return None
+
+    candidates: list[tuple[float, float, Affine2D]] = []
+    for base in (
+        Affine2D.from_rotation(angle_a - angle_b),
+        Affine2D.from_rotation(angle_a - angle_b + math.pi),
+    ):
+        bx, by = base.apply(*seam_mid_b)
+        xform = Affine2D.from_translation(seam_mid_a[0] - bx, seam_mid_a[1] - by).compose(base)
+        ref_outline = xform.apply_pts(pb_ref.outline)
+        ref_holes = [xform.apply_pts(h) for h in pb_ref.holes]
+        poly_b_ref = _polygon_from_outline_holes(ref_outline, ref_holes)
+        if poly_b_ref is None:
+            continue
+        try:
+            overlap_area = float(poly_a_ref.intersection(poly_b_ref).area)
+        except Exception:
+            overlap_area = float("inf")
+        tb0 = xform.apply(*b0)
+        tb1 = xform.apply(*b1)
+        same_err = (
+            abs(tb0[0] - a0[0]) + abs(tb0[1] - a0[1]) +
+            abs(tb1[0] - a1[0]) + abs(tb1[1] - a1[1])
+        )
+        candidates.append((overlap_area, same_err, xform))
+
+    if not candidates:
+        return None
+
+    _, _, best_xform = min(candidates, key=lambda item: (item[0], item[1]))
+    return best_xform.apply_pts(pb.outline), [best_xform.apply_pts(h) for h in pb.holes], best_xform
+
+
+def _iter_polygon_geoms(geom):
+    if geom is None or getattr(geom, "is_empty", True):
+        return
+    geom_type = getattr(geom, "geom_type", "")
+    if geom_type == "Polygon":
+        yield geom
+        return
+    if geom_type in {"MultiPolygon", "GeometryCollection"}:
+        for sub in geom.geoms:
+            yield from _iter_polygon_geoms(sub)
+
+
+def _draw_polygonal_geom(
+    dwg,
+    geom,
+    *,
+    shift_x: float,
+    shift_y: float,
+    y_offset: float,
+    stroke: str,
+    stroke_width: str,
+    fill: str,
+    fill_opacity: str,
+) -> None:
+    def _path_from_loop(loop: list[tuple[float, float]]) -> str:
+        shifted = [(x + shift_x, y + shift_y + y_offset) for x, y in loop]
+        parts = [f"M {shifted[0][0]:.4f},{shifted[0][1]:.4f}"]
+        for p in shifted[1:]:
+            parts.append(f"L {p[0]:.4f},{p[1]:.4f}")
+        parts.append("Z")
+        return " ".join(parts)
+
+    for poly in _iter_polygon_geoms(geom):
+        ext = list(poly.exterior.coords)
+        loop = [(float(x), float(y)) for x, y in ext[:-1]]
+        if len(loop) < 3:
+            continue
+        dwg.add(
+            dwg.path(
+                d=_path_from_loop(loop),
+                stroke=stroke,
+                stroke_width=stroke_width,
+                fill=fill,
+                fill_opacity=fill_opacity,
+            )
+        )
+        for hole in poly.interiors:
+            hole_pts = [(float(x), float(y)) for x, y in list(hole.coords)[:-1]]
+            if len(hole_pts) >= 3:
+                dwg.add(
+                    dwg.path(
+                        d=_path_from_loop(hole_pts),
+                        stroke=stroke,
+                        stroke_width="0.3",
+                        fill="none",
+                        opacity="0.6",
+                    )
+                )
+
+
+def _signed_distance_to_line(
+    pt: tuple[float, float],
+    line_p0: tuple[float, float],
+    line_dir: tuple[float, float],
+) -> float:
+    dx = pt[0] - line_p0[0]
+    dy = pt[1] - line_p0[1]
+    return dx * (-line_dir[1]) + dy * line_dir[0]
+
+
+def _build_seam_band(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    *,
+    thickness: float,
+    finger_width: float,
+):
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+    seg_len = math.hypot(dx, dy)
+    if seg_len < 1e-6:
+        return None
+    tx = dx / seg_len
+    ty = dy / seg_len
+    nx = -ty
+    ny = tx
+    length_pad = max(2.0, thickness * 0.8)
+    band_half_depth = max(thickness * 2.8, min(finger_width * 0.45, 10.0))
+    outline = [
+        (p0[0] - tx * length_pad - nx * band_half_depth, p0[1] - ty * length_pad - ny * band_half_depth),
+        (p1[0] + tx * length_pad - nx * band_half_depth, p1[1] + ty * length_pad - ny * band_half_depth),
+        (p1[0] + tx * length_pad + nx * band_half_depth, p1[1] + ty * length_pad + ny * band_half_depth),
+        (p0[0] - tx * length_pad + nx * band_half_depth, p0[1] - ty * length_pad + ny * band_half_depth),
+    ]
+    return _polygon_from_outline_holes(outline, [])
+
+
+def _draw_pair_overlap_checks(
+    joint_model: BinModel,
+    reference_model: BinModel,
+    seam_infos: list[dict],
+    output_dir: str,
+    finger_width: float,
+) -> list[dict]:
+    if svgwrite is None:
+        raise ImportError("svgwrite is required for debug pipeline exports")
+
+    panel_map: dict[str, Any] = {}
+    ref_panel_map: dict[str, Any] = {}
+    for name, panel in joint_model.panels.items():
+        p2d = _project_panel(panel.solid, panel.outer_normal, name)
+        if p2d is not None:
+            panel_map[name] = p2d
+            ref_panel = reference_model.panels.get(name)
+            if ref_panel is not None:
+                ref_p2d = _project_panel(ref_panel.solid, ref_panel.outer_normal, name, frame=p2d)
+                if ref_p2d is not None:
+                    ref_panel_map[name] = ref_p2d
+
+    pair_dir = os.path.join(output_dir, "06_pair_overlap_checks")
+    os.makedirs(pair_dir, exist_ok=True)
+    for stale in os.listdir(pair_dir):
+        if stale.lower().endswith(".svg"):
+            os.remove(os.path.join(pair_dir, stale))
+
+    results: list[dict] = []
+    display_scale = 3.0  # 300% visual zoom for easier inspection
+    for info in seam_infos:
+        if info["kind"] == "living_hinge":
+            continue
+        seam = info["seam"]
+        if (
+            seam.panel_a not in panel_map
+            or seam.panel_b not in panel_map
+            or seam.panel_a not in ref_panel_map
+            or seam.panel_b not in ref_panel_map
+        ):
+            continue
+
+        pa = panel_map[seam.panel_a]
+        pa_ref = ref_panel_map[seam.panel_a]
+        pb_ref = ref_panel_map[seam.panel_b]
+        transformed = _choose_pair_alignment_transform(
+            seam.panel_a,
+            seam.panel_b,
+            seam,
+            panel_map,
+            ref_panel_map,
+        )
+        if transformed is None:
+            continue
+        b_outline, b_holes, xform_b = transformed
+        a_outline = list(pa.outline)
+        a_holes = [list(h) for h in pa.holes]
+        a_ref_outline = list(pa_ref.outline)
+        a_ref_holes = [list(h) for h in pa_ref.holes]
+        b_ref_outline = xform_b.apply_pts(pb_ref.outline)
+        b_ref_holes = [xform_b.apply_pts(h) for h in pb_ref.holes]
+
+        poly_a = _polygon_from_outline_holes(a_outline, a_holes)
+        poly_a_ref = _polygon_from_outline_holes(a_ref_outline, a_ref_holes)
+        poly_b = _polygon_from_outline_holes(b_outline, b_holes)
+        poly_b_ref = _polygon_from_outline_holes(b_ref_outline, b_ref_holes)
+        if poly_a is None or poly_b is None or poly_a_ref is None or poly_b_ref is None:
+            continue
+
+        seam_a0_raw = pa.project_3d(seam.start_3d)
+        seam_a1_raw = pa.project_3d(seam.end_3d)
+        adx = seam_a1_raw[0] - seam_a0_raw[0]
+        ady = seam_a1_raw[1] - seam_a0_raw[1]
+        seg_len = math.hypot(adx, ady)
+        if seg_len < 1e-6:
+            continue
+        seam_dir = (adx / seg_len, ady / seg_len)
+
+        a_center = (float(poly_a_ref.centroid.x), float(poly_a_ref.centroid.y))
+        b_center = (float(poly_b_ref.centroid.x), float(poly_b_ref.centroid.y))
+        dist_a = _signed_distance_to_line(a_center, seam_a0_raw, seam_dir)
+        dist_b = _signed_distance_to_line(b_center, seam_a0_raw, seam_dir)
+        shift_sign = 1.0 if dist_a >= dist_b else -1.0
+        shift_vec = (-seam_dir[1] * joint_model.thickness * shift_sign, seam_dir[0] * joint_model.thickness * shift_sign)
+
+        b_outline = _translate_pts(b_outline, shift_vec[0], shift_vec[1])
+        b_holes = [_translate_pts(h, shift_vec[0], shift_vec[1]) for h in b_holes]
+        b_ref_outline = _translate_pts(b_ref_outline, shift_vec[0], shift_vec[1])
+        b_ref_holes = [_translate_pts(h, shift_vec[0], shift_vec[1]) for h in b_ref_holes]
+
+        poly_b = _polygon_from_outline_holes(b_outline, b_holes)
+        poly_b_ref = _polygon_from_outline_holes(b_ref_outline, b_ref_holes)
+        if poly_b is None or poly_b_ref is None:
+            continue
+
+        added_a = poly_a.difference(poly_a_ref)
+        added_b = poly_b.difference(poly_b_ref)
+
+        intersection = None
+        intersection_area = 0.0
+        full_overlap_area = 0.0
+        baseline_overlap_area = 0.0
+        try:
+            full_overlap = poly_a.intersection(poly_b)
+            baseline_overlap = poly_a_ref.intersection(poly_b_ref)
+            band = _build_seam_band(
+                seam_a0_raw,
+                seam_a1_raw,
+                thickness=joint_model.thickness,
+                finger_width=finger_width,
+            )
+            if band is not None:
+                full_overlap = full_overlap.intersection(band)
+                baseline_overlap = baseline_overlap.intersection(band)
+            if not full_overlap.is_empty:
+                full_overlap_area = float(full_overlap.area)
+            if not baseline_overlap.is_empty:
+                baseline_overlap_area = float(baseline_overlap.area)
+            intersection = full_overlap
+            if not intersection.is_empty:
+                intersection_area = float(intersection.area)
+        except Exception:
+            intersection = None
+
+        all_pts = a_outline + b_outline + a_ref_outline + b_ref_outline
+        min_x = min(p[0] for p in all_pts)
+        min_y = min(p[1] for p in all_pts)
+        max_x = max(p[0] for p in all_pts)
+        max_y = max(p[1] for p in all_pts)
+        pad = 8.0
+        shift_x = -min_x + pad
+        shift_y = -min_y + pad
+        total_w = (max_x - min_x) + pad * 2
+        total_h = (max_y - min_y) + pad * 2 + 14.0
+        seam_a0 = (seam_a0_raw[0] + shift_x, seam_a0_raw[1] + shift_y)
+        seam_a1 = (seam_a1_raw[0] + shift_x, seam_a1_raw[1] + shift_y)
+
+        safe_name = f"{info['id']}-{seam.panel_a}--{seam.panel_b}".replace("/", "_")
+        out_path = os.path.join(pair_dir, f"{safe_name}.svg")
+        dwg = svgwrite.Drawing(
+            out_path,
+            size=(f"{total_w * display_scale}mm", f"{total_h * display_scale}mm"),
+            viewBox=f"0 0 {total_w} {total_h}",
+        )
+        dwg.add(dwg.rect(insert=(0, 0), size=(total_w, total_h), fill="#FFFFFF", stroke="none"))
+        dwg.add(
+            dwg.text(
+                f"{info['id']}  {seam.panel_a} <-> {seam.panel_b}",
+                insert=(4, 4),
+                text_anchor="start",
+                dominant_baseline="hanging",
+                font_size="5",
+                font_weight="bold",
+                fill="#202020",
+            )
+        )
+        dwg.add(
+            dwg.text(
+                (
+                    f"Gray = stage 03 reference, black/blue = full stage 05 shapes, "
+                    f"red = any seam-local overlap/interference, area = {intersection_area:.3f} mm^2"
+                ),
+                insert=(4, 10),
+                text_anchor="start",
+                dominant_baseline="hanging",
+                font_size="3.2",
+                fill="#666666",
+            )
+        )
+
+        _draw_polygonal_geom(
+            dwg,
+            poly_a_ref,
+            shift_x=shift_x,
+            shift_y=shift_y,
+            y_offset=12.0,
+            stroke="#777777",
+            stroke_width="0.45",
+            fill="none",
+            fill_opacity="0.0",
+        )
+        _draw_polygonal_geom(
+            dwg,
+            poly_b_ref,
+            shift_x=shift_x,
+            shift_y=shift_y,
+            y_offset=12.0,
+            stroke="#777777",
+            stroke_width="0.45",
+            fill="none",
+            fill_opacity="0.0",
+        )
+        _draw_polygonal_geom(
+            dwg,
+            poly_a,
+            shift_x=shift_x,
+            shift_y=shift_y,
+            y_offset=12.0,
+            stroke="#111111",
+            stroke_width="0.5",
+            fill="#000000",
+            fill_opacity="0.5",
+        )
+        _draw_polygonal_geom(
+            dwg,
+            poly_b,
+            shift_x=shift_x,
+            shift_y=shift_y,
+            y_offset=12.0,
+            stroke="#1D4ED8",
+            stroke_width="0.5",
+            fill="#2563EB",
+            fill_opacity="0.5",
+        )
+        _draw_polygonal_geom(
+            dwg,
+            added_a,
+            shift_x=shift_x,
+            shift_y=shift_y,
+            y_offset=12.0,
+            stroke="#111111",
+            stroke_width="0.5",
+            fill="#111111",
+            fill_opacity="0.18",
+        )
+        _draw_polygonal_geom(
+            dwg,
+            added_b,
+            shift_x=shift_x,
+            shift_y=shift_y,
+            y_offset=12.0,
+            stroke="#1D4ED8",
+            stroke_width="0.5",
+            fill="#2563EB",
+            fill_opacity="0.18",
+        )
+        dwg.add(dwg.line(start=(seam_a0[0], seam_a0[1] + 12.0), end=(seam_a1[0], seam_a1[1] + 12.0), stroke="#10B981", stroke_width=1.0, stroke_dasharray="2.0,1.2"))
+
+        _draw_polygonal_geom(
+            dwg,
+            intersection,
+            shift_x=shift_x,
+            shift_y=shift_y,
+            y_offset=12.0,
+            stroke="#FF0000",
+            stroke_width="0.6",
+            fill="#FF0000",
+            fill_opacity="0.7",
+        )
+
+        dwg.save()
+        results.append(
+            {
+                "id": info["id"],
+                "pair_name": info["pair_name"],
+                "kind": info["kind"],
+                "file": os.path.relpath(out_path, output_dir),
+                "full_overlap_area": round(full_overlap_area, 6),
+                "baseline_overlap_area": round(baseline_overlap_area, 6),
+                "intersection_area": round(intersection_area, 6),
+            }
+        )
+
+    return results
+
+
 def _bbox_dict(shape: cq.Shape) -> dict[str, float]:
     bb = shape.BoundingBox()
     return {
@@ -572,6 +1063,7 @@ def _json_report(
     step_file: str,
     stages: list[PipelineStage],
     seam_infos: list[dict],
+    pair_overlap_checks: list[dict],
     output_dir: str,
     thickness: float,
     finger_width: float,
@@ -630,6 +1122,7 @@ def _json_report(
         ],
         "panels": panels,
         "seams": seams,
+        "pair_overlap_checks": pair_overlap_checks,
         "final_panel_bboxes": {
             name: _bbox_dict(panel.solid) for name, panel in final_stage.model.panels.items()
         },
@@ -637,8 +1130,10 @@ def _json_report(
             "00_raw_extract": "00_raw_extract.svg",
             "01_raw_vs_clean": "01_raw_vs_clean.svg",
             "02_clean_geometry": "02_clean_geometry.svg",
-            "03_seams": "03_seams.svg",
-            "04_joint_application": "04_joint_application.svg",
+            "03_join_interfaces": "03_join_interfaces.svg",
+            "04_seams": "04_seams.svg",
+            "05_joint_application": "05_joint_application.svg",
+            "06_pair_overlap_checks": "06_pair_overlap_checks/",
             "X_current_generator_comparison": "X_current_generator_comparison.svg",
         },
     }
@@ -667,10 +1162,12 @@ def main() -> None:
         "00_raw_extract.svg",
         "01_raw_vs_clean.svg",
         "02_clean_geometry.svg",
-        "03_seams.svg",
+        "03_join_interfaces.svg",
+        "04_seams.svg",
         "04_final_joints.svg",
         "04_current_generator_joints.svg",
         "04_joint_application.svg",
+        "05_joint_application.svg",
         "05_pipeline_attempt_joints.svg",
         "X_current_generator_comparison.svg",
         "report.json",
@@ -683,11 +1180,12 @@ def main() -> None:
     outer_raw_model = _build_raw_model(source_model)
     raw_model = _build_inner_raw_model(source_model)
     clean_model = _build_working_model(source_model)
-    seam_infos = _seam_debug_info(clean_model, clean_model, args.living_hinge_angle)
+    join_interface_model = _build_join_interface_model(source_model)
+    seam_infos = _seam_debug_info(join_interface_model, join_interface_model, args.living_hinge_angle)
     joint_input_model = BinModel(
-        panels=clean_model.panels,
-        shared_edges=clean_model.shared_edges,
-        thickness=clean_model.thickness,
+        panels=join_interface_model.panels,
+        shared_edges=join_interface_model.shared_edges,
+        thickness=join_interface_model.thickness,
         source_solid=None,
     )
     joint_application_model = apply_finger_joints(
@@ -731,22 +1229,37 @@ def main() -> None:
             notes=["Canonical pre-joint stage used for seam display and joint application."],
         ),
         PipelineStage(
-            id="03_seams",
-            title="03 Seam Classification",
-            subtitle="Seams classified only from stage 02 geometry and drawn on the same stage 02 outlines",
-            model=clean_model,
+            id="03_join_interfaces",
+            title="03 Join Interfaces",
+            subtitle="Black = consistent inner-face seam domain for all panels, green dashed = stage 02 clean geometry",
+            model=join_interface_model,
             input_stage="02_clean_geometry",
+            reference_model=clean_model,
+            notes=[
+                "This stage rebuilds every panel on a consistent inner-face seam domain.",
+                "It is intended to bridge clean reference geometry and actual seam reasoning.",
+            ],
+        ),
+        PipelineStage(
+            id="04_seams",
+            title="04 Seam Classification",
+            subtitle="Seams classified from stage 03 join-interface geometry and drawn on the same geometry",
+            model=join_interface_model,
+            input_stage="03_join_interfaces",
             seam_infos=seam_infos,
             notes=["No fallback to source-model seams in numbered stages."],
         ),
         PipelineStage(
-            id="04_joint_application",
-            title="04 Joint Application",
-            subtitle="Black = joints applied directly to stage 03 geometry; green dashed = stage 02 clean geometry",
+            id="05_joint_application",
+            title="05 Joint Application",
+            subtitle="Black = joints applied directly to stage 03/04 join-interface geometry, green dashed = stage 03 join interfaces",
             model=joint_application_model,
-            input_stage="03_seams",
-            reference_model=clean_model,
-            notes=["This is the true sequential continuation of stage 03.", "If this looks wrong, the break is between stage 03 seam logic and joint application."],
+            input_stage="04_seams",
+            reference_model=join_interface_model,
+            notes=[
+                "This is the true sequential continuation of stage 04.",
+                "If this looks wrong, the break is now between join-interface seams and joint application.",
+            ],
         ),
     ]
 
@@ -768,10 +1281,19 @@ def main() -> None:
         reference_model=source_model,
     )
 
+    pair_overlap_checks = _draw_pair_overlap_checks(
+        joint_application_model,
+        join_interface_model,
+        seam_infos,
+        output_dir,
+        args.finger_width,
+    )
+
     report = _json_report(
         args.step_file,
         stages,
         seam_infos,
+        pair_overlap_checks,
         output_dir,
         args.thickness,
         args.finger_width,

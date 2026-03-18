@@ -641,6 +641,28 @@ def _corner_keepout_for_edge(
     return (start_keepout, end_keepout)
 
 
+def _finger_end_keepouts(
+    se: SharedEdge,
+    corners: list[tuple[tuple[float, float, float], set[str]]],
+    thickness: float,
+    finger_width: float,
+) -> tuple[float, float]:
+    """Return seam-end keepouts tuned for finger joints.
+
+    Raw corner keepouts at exactly material thickness are enough to classify a
+    corner, but they still allow tiny first/last finger cells to appear right
+    next to 3-panel corners. For finger seams we reserve a larger end margin so
+    the first actual tab/slot starts a little away from the corner.
+    """
+    start_keepout, end_keepout = _corner_keepout_for_edge(se, corners, thickness)
+    preferred = max(thickness, min(finger_width * 0.35, se.edge_length * 0.18))
+    if start_keepout > 0:
+        start_keepout = max(start_keepout, preferred)
+    if end_keepout > 0:
+        end_keepout = max(end_keepout, preferred)
+    return (start_keepout, end_keepout)
+
+
 # ---------------------------------------------------------------------------
 # Inset detection
 # ---------------------------------------------------------------------------
@@ -1377,9 +1399,10 @@ def apply_finger_joints(
         in_plane_a = _edge_inward_direction(pa, edge_a_start, edge_a_end)
         in_plane_b = _edge_inward_direction(pb, edge_b_start, edge_b_end)
 
-        # Keepouts at corners
-        start_keepout, end_keepout = _corner_keepout_for_edge(
-            se, corners, thickness
+        # Keep finger cells away from multi-panel corners to avoid tiny seam-end
+        # remnants that look like stray tabs without matching opposite cutouts.
+        start_keepout, end_keepout = _finger_end_keepouts(
+            se, corners, thickness, finger_width
         )
 
         # Compute finger layout
