@@ -881,7 +881,11 @@ def _compute_in_plane_dims(
 # Public API
 # ---------------------------------------------------------------------------
 
-def load_step_panels(step_path: str, thickness: float = 3.2) -> BinModel:
+def load_step_panels(
+    step_path: str,
+    thickness: float = 3.2,
+    enable_back_lip_split: bool = False,
+) -> BinModel:
     """Load a STEP file and return a BinModel with thickened panels and shared edges.
 
     Parameters
@@ -975,7 +979,7 @@ def load_step_panels(step_path: str, thickness: float = 3.2) -> BinModel:
     lip_additions: dict[str, list[cq.Shape]] = {}
     debug_cut_lines: dict[str, list[tuple[tuple[float, float, float], tuple[float, float, float]]]] = {}
 
-    if len(solids) == 1 and "bottom" in names and "back_wall" in names:
+    if enable_back_lip_split and len(solids) == 1 and "bottom" in names and "back_wall" in names:
         named_bodies = {name: bd for bd, name in zip(bodies_data, names)}
         back_face = named_bodies["back_wall"]["outer_face"]
         back_center = back_face.Center()
@@ -1024,7 +1028,7 @@ def load_step_panels(step_path: str, thickness: float = 3.2) -> BinModel:
 
         clean_face = raw_face
         clean_edges = raw_edges
-        if len(solids) == 1:
+        if enable_back_lip_split and len(solids) == 1:
             clean_face, clean_edges = _clean_panel_face_for_back_lip(
                 name,
                 raw_face,
