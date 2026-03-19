@@ -35,6 +35,11 @@ from lasercut.panels import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+_BACK_WALL_OUTLINE_CLEARANCE_MM = 1.0
+_THROUGH_SLOT_BOUNDARY_OVERCUT_MM = 0.8
+_THROUGH_SLOT_END_OVERRUN_MM = 5.0
+
+
 def _normalize(v: tuple[float, float, float]) -> tuple[float, float, float]:
     length = _vec_len(v)
     if length < 1e-12:
@@ -528,6 +533,13 @@ def _apply_finger_joints_cqwarehouse(
         model.thickness,
         kerf=kerf,
     )
+    trimmed_seams += _trim_back_wall_corner_overhangs_at_bottom(
+        model.shared_edges,
+        panels,
+        corners,
+        model.thickness,
+        kerf=kerf,
+    )
 
     print(
         f"  cq_warehouse: jointed {len(matched_names)} panels "
@@ -869,29 +881,24 @@ def _complement_intervals(
     return out
 
 
-def _inset_slot_intervals_from_lip(
-    se: SharedEdge,
+def _outer_lip_carrier_intervals(
     slot_panel: Panel,
     slot_start: tuple[float, float, float],
     slot_end: tuple[float, float, float],
     edge_dir: tuple[float, float, float],
     slot_in_plane: tuple[float, float, float],
     thickness: float,
-    finger_width: float,
-    start_keepout: float,
-    end_keepout: float,
-    segment_end_trim: float = 3.5,
 ) -> list[tuple[float, float]]:
-    """Find slot intervals where the slot-panel lip is full-depth (not notched).
+    """Return seam-param intervals carried by the slot panel's outer lip.
 
-    For inset seams with a notched lip, we only cut through-slot segments where
-    the outer lip is present. This avoids removing bridges at lip-notch locations.
+    We look for seam-parallel outer-boundary runs on the outside of the seam and
+    keep the outermost band. Those runs mark where the bottom outline actually
+    has enough lip material to support a matching slot/tab pair.
     """
     d_len = _vec_len(_vec_sub(slot_end, slot_start))
     if d_len < 1e-6:
         return []
 
-    # Gather seam-parallel boundary segments near the seam on the lip/outside side.
     raw: list[tuple[float, float, float]] = []  # (u, lo, hi)
     search_band = max(thickness * 3.5, 12.0)
     for p0, p1 in slot_panel.outer_edges:
@@ -910,12 +917,12 @@ def _inset_slot_intervals_from_lip(
         u0 = _vec_dot(v0, slot_in_plane)
         u1 = _vec_dot(v1, slot_in_plane)
 
-        # Nearly constant offset from seam, i.e. seam-parallel lip segment.
+        # Keep only seam-parallel runs near a constant offset from the seam.
         if abs(u0 - u1) > max(0.8, thickness * 0.4):
             continue
         u = (u0 + u1) / 2.0
         if u > 0.4:
-            continue  # interior side; seam lip is on negative side
+            continue
         if abs(u) > search_band:
             continue
 
@@ -928,36 +935,67 @@ def _inset_slot_intervals_from_lip(
     if not raw:
         return []
 
-    # Full-depth lip segments are the farthest outward (most negative u).
+    # The usable carrier runs are the outermost ones, not the seam-adjacent
+    # notch valleys. This works for irregular back-notch spacing as well.
     u_outer = min(u for u, _, _ in raw)
     u_cutoff = u_outer + max(0.8, thickness * 0.5)
-    selected = [(lo, hi) for u, lo, hi in raw if u <= u_cutoff]
-    selected = _merge_intervals(selected)
+    return _merge_intervals([(lo, hi) for u, lo, hi in raw if u <= u_cutoff])
 
-    # Apply corner keepouts and drop tiny fragments.
+
+def _inset_slot_intervals_from_lip(
+    se: SharedEdge,
+    slot_panel: Panel,
+    slot_start: tuple[float, float, float],
+    slot_end: tuple[float, float, float],
+    edge_dir: tuple[float, float, float],
+    slot_in_plane: tuple[float, float, float],
+    thickness: float,
+    finger_width: float,
+    start_keepout: float,
+    end_keepout: float,
+    segment_end_trim: float = _BACK_WALL_OUTLINE_CLEARANCE_MM,
+) -> list[tuple[float, float]]:
+    """Find slot intervals where the slot-panel lip is full-depth (not notched).
+
+    For inset seams with a notched lip, we derive candidate slot intervals from
+    the actual outer lip carrier runs and then trim each side by a fixed safety
+    clearance. This keeps slots/tabs away from irregular notch transitions.
+    """
+    del se
+    del finger_width
+    d_len = _vec_len(_vec_sub(slot_end, slot_start))
+    if d_len < 1e-6:
+        return []
+
+    selected = _outer_lip_carrier_intervals(
+        slot_panel=slot_panel,
+        slot_start=slot_start,
+        slot_end=slot_end,
+        edge_dir=edge_dir,
+        slot_in_plane=slot_in_plane,
+        thickness=thickness,
+    )
+    if not selected:
+        return []
+
     usable_lo = start_keepout
     usable_hi = d_len - end_keepout
-    min_seg = max(12.0, finger_width * 0.9)
+    min_after_trim = max(_BACK_WALL_OUTLINE_CLEARANCE_MM, thickness * 0.6)
     clipped: list[tuple[float, float]] = []
     for lo, hi in selected:
         lo = max(lo, usable_lo)
         hi = min(hi, usable_hi)
-        if hi - lo >= min_seg:
+        if hi - lo > 0.2:
             clipped.append((lo, hi))
 
-    # Trim each segment's ends so tabs/slots stay clear of nearby notch valleys.
-    if segment_end_trim > 0:
-        trimmed: list[tuple[float, float]] = []
-        min_after_trim = max(8.0, finger_width * 0.45)
-        for lo, hi in clipped:
-            tlo = lo + segment_end_trim
-            thi = hi - segment_end_trim
-            if thi - tlo >= min_after_trim:
-                trimmed.append((tlo, thi))
-        if trimmed:
-            return trimmed
+    trimmed: list[tuple[float, float]] = []
+    for lo, hi in clipped:
+        tlo = lo + max(0.0, segment_end_trim)
+        thi = hi - max(0.0, segment_end_trim)
+        if thi - tlo >= min_after_trim:
+            trimmed.append((tlo, thi))
 
-    return clipped
+    return trimmed
 
 
 def _is_side_wall_name(name: str) -> bool:
@@ -1043,6 +1081,129 @@ def _trim_side_wall_overhangs_against_back_wall(
         side_panel.solid = solid
         trimmed_count += 1
 
+    return trimmed_count
+
+
+def _trim_back_wall_corner_overhangs_at_bottom(
+    shared_edges: list[SharedEdge],
+    panels: dict[str, Panel],
+    corners: list[tuple[tuple[float, float, float], set[str]]],
+    thickness: float,
+    kerf: float = 0.0,
+    end_trim: float = 4.0,
+) -> int:
+    """Clear bottom/back-wall seam contact wherever no bottom slot exists.
+
+    The irregular back lip now determines the valid bottom slot intervals. On
+    the back-wall side we only want material to reach the seam line where those
+    intervals exist too. A narrow cleanup strip along the seam removes any
+    residual corner shoulders or other seam-line stubs outside those spans.
+    """
+    back_wall = panels.get("back_wall")
+    if back_wall is None or end_trim <= 0:
+        return 0
+
+    bottom_back_seam: SharedEdge | None = None
+    for se in shared_edges:
+        if "back_wall" not in {se.panel_a, se.panel_b}:
+            continue
+        other = se.panel_b if se.panel_a == "back_wall" else se.panel_a
+        if _is_bottom_panel_name(other):
+            bottom_back_seam = se
+            break
+
+    if bottom_back_seam is None:
+        return 0
+
+    joint_type, slot_panel_name = _classify_joint_type(bottom_back_seam, panels)
+    if joint_type != "through_slot" or slot_panel_name not in panels:
+        return 0
+
+    slot_panel = panels[slot_panel_name]
+    if not _is_bottom_panel_name(slot_panel.name):
+        return 0
+
+    slot_start, slot_end = _project_edge_to_panel(bottom_back_seam, slot_panel)
+    slot_vec = _vec_sub(slot_end, slot_start)
+    slot_len = _vec_len(slot_vec)
+    if slot_len < 1e-6:
+        return 0
+
+    edge_dir = _normalize(slot_vec)
+    slot_in_plane = _edge_inward_direction(slot_panel, slot_start, slot_end)
+    slot_intervals = _inset_slot_intervals_from_lip(
+        se=bottom_back_seam,
+        slot_panel=slot_panel,
+        slot_start=slot_start,
+        slot_end=slot_end,
+        edge_dir=edge_dir,
+        slot_in_plane=slot_in_plane,
+        thickness=thickness,
+        finger_width=20.0,
+        start_keepout=0.0,
+        end_keepout=0.0,
+    )
+    if not slot_intervals:
+        return 0
+
+    wall_start, wall_end = _project_edge_to_panel(bottom_back_seam, back_wall)
+    wall_vec = _vec_sub(wall_end, wall_start)
+    wall_len = _vec_len(wall_vec)
+    if wall_len < 1e-6:
+        return 0
+
+    wall_dir = _normalize(wall_vec)
+    if _vec_dot(wall_dir, edge_dir) < 0:
+        wall_start, wall_end = wall_end, wall_start
+        wall_dir = (-wall_dir[0], -wall_dir[1], -wall_dir[2])
+
+    # Extend farther than the main seam recess: these residuals tend to survive
+    # just beyond the nominal seam endpoints where neighboring corner geometry
+    # folds into the same boundary line in projection.
+    cleanup_margin = max(
+        end_trim * 2.0,
+        _THROUGH_SLOT_END_OVERRUN_MM + thickness,
+        thickness * 2.5,
+    )
+    cleanup_intervals = _complement_intervals(
+        -cleanup_margin,
+        wall_len + cleanup_margin,
+        slot_intervals,
+    )
+    if not cleanup_intervals:
+        return 0
+
+    cut_width = max(0.2, thickness - kerf)
+    boundary_overcut = _THROUGH_SLOT_BOUNDARY_OVERCUT_MM
+    cleanup_depth = cut_width + 2.0 * boundary_overcut
+    wall_in_plane = _edge_inward_direction(back_wall, wall_start, wall_end)
+    into_back = _normalize((
+        -back_wall.outer_normal[0],
+        -back_wall.outer_normal[1],
+        -back_wall.outer_normal[2],
+    ))
+
+    solid = _to_cuttable(back_wall.solid)
+    trimmed_count = 0
+    for lo, hi in cleanup_intervals:
+        trim_len = hi - lo
+        if trim_len <= 0.1:
+            continue
+        origin = _add(wall_start, _scale(wall_dir, lo))
+        origin = _add(origin, _scale(wall_in_plane, -boundary_overcut))
+        trim_box = _make_oriented_box(
+            origin=origin,
+            x_dir=wall_dir,
+            y_dir=wall_in_plane,
+            z_dir=into_back,
+            dx=trim_len,
+            dy=cleanup_depth,
+            dz=thickness * 2,
+        )
+        solid = _to_cuttable(solid.cut(trim_box))
+        trimmed_count += 1
+
+    back_wall.solid = solid
     return trimmed_count
 
 
@@ -1264,14 +1425,24 @@ def _apply_through_slot(
     ))
 
     solid_wall = _to_cuttable(wall_panel.solid)
-    boundary_overcut = 0.2
+    boundary_overcut = _THROUGH_SLOT_BOUNDARY_OVERCUT_MM
+    end_overrun = max(_THROUGH_SLOT_END_OVERRUN_MM, thickness)
+    seam_tol = 0.05
     for lo, hi in recess_intervals:
-        cut_len = hi - lo
+        cut_lo = lo
+        cut_hi = hi
+        if lo <= wall_usable_start + seam_tol:
+            cut_lo -= end_overrun
+        if hi >= wall_usable_end - seam_tol:
+            cut_hi += end_overrun
+
+        cut_len = cut_hi - cut_lo
         if cut_len <= 0:
             continue
-        cut_origin = _add(wall_start, _scale(wall_dir, lo))
+        cut_origin = _add(wall_start, _scale(wall_dir, cut_lo))
         # Nudge outward across the seam boundary to avoid zero-width skins that
-        # can otherwise show up as stray "inner hole" loops in 2D projection.
+        # can otherwise show up as stray seam-end shoulders or inner loops in
+        # 2D projection.
         cut_origin = _add(cut_origin, _scale(wall_in_plane, -boundary_overcut))
         recess_box = _make_oriented_box(
             origin=cut_origin,
@@ -1458,6 +1629,13 @@ def apply_finger_joints(
         pb.solid = solid_b
 
     _trim_side_wall_overhangs_against_back_wall(
+        model.shared_edges,
+        panels,
+        corners,
+        thickness,
+        kerf=kerf,
+    )
+    _trim_back_wall_corner_overhangs_at_bottom(
         model.shared_edges,
         panels,
         corners,
